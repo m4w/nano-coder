@@ -2,6 +2,38 @@
 //! events into streamed text, collapsible thinking and inline tool calls.
 
 use std::io::{self, IsTerminal, Write};
+
+/// Frames of the busy spinner drawn in place of the prompt glyph.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// How long each spinner frame shows; the frame is redrawn this often.
+pub const SPINNER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The prompt glyph: a cyan spinner while a turn runs, a green `›` when the
+/// harness is waiting for the user.
+fn prompt_glyph(busy_since: Option<Instant>) -> String {
+    match busy_since {
+        Some(started) => {
+            let frame = (started.elapsed().as_millis() / SPINNER_INTERVAL.as_millis()) as usize % SPINNER.len();
+            format!("\x1b[38;5;117m{}\x1b[39m", SPINNER[frame])
+        }
+        None => "\x1b[38;5;114m›\x1b[39m".to_string(),
+    }
+}
+
+/// The dim hint after the cursor of an empty editor: whose turn it is.
+fn prompt_hint(busy_since: Option<Instant>) -> String {
+    match busy_since {
+        Some(started) => format!("working {} · Enter steers, Esc Esc cancels", elapsed_text(started.elapsed())),
+        None => "ready · type a message, /help for commands".to_string(),
+    }
+}
+
+/// `4s`, `1m 05s`: whole seconds of the running turn.
+fn elapsed_text(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 { format!("{secs}s") } else { format!("{}m {:02}s", secs / 60, secs % 60) }
+}
+
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -265,6 +297,9 @@ struct FrameState {
     /// and only restamps on submission, so mirror that by refreshing this only
     /// at a turn boundary.
     prompt_stamp: String,
+    /// When the running turn started; `None` while the prompt waits for the
+    /// user. Drives the busy spinner in place of the `›` prompt glyph.
+    busy_since: Option<Instant>,
     /// A transient hint shown on the status bar (e.g. "(Ctrl-C again to
     /// exit)") instead of as a transcript item. Transient notes are
     /// cursor-relevant feedback: as a transcript item they would trigger a
@@ -279,6 +314,31 @@ struct FrameState {
     /// (O(events²) work and a terminal write per event on a long session).
     /// The caller renders once when the batch is complete.
     batch: bool,
+    /// Monotonic counter bumped on EVERY transcript mutation (`push`, `extend`,
+    /// `clear`, and the in-place streamed edits to the last item). Keys
+    /// `transcript_cache` so a stale wrapped-lines entry is never reused after
+    /// the items changed — a length-only key would miss an in-place edit that
+    /// keeps the item count (e.g. a `TextDelta` growing the streamed message).
+    transcript_version: u64,
+    /// Cache of the wrapped transcript lines: the `transcript_version` and wrap
+    /// width the lines were built at, plus the lines. The 100 ms spinner `tick`
+    /// re-renders the frame without touching the transcript, and the frame
+    /// renderer already diffs composed lines (rewriting only from the first
+    /// changed row), so re-wrapping every item on each tick would make an idle
+    /// model/tool wait cost O(transcript) ten times a second for no visible
+    /// change. A width change also re-wraps (the key includes the width).
+    transcript_cache: Option<(u64, usize, Vec<String>)>,
+}
+
+impl FrameState {
+    /// Record a transcript mutation: bump the version so the next
+    /// `frame_render` re-wraps rather than reusing now-stale cached lines.
+    /// Call after ANY change to `items` — a push/extend/clear AND the in-place
+    /// streamed edits to the last item (which keep the item count, so a
+    /// length-keyed cache would miss them).
+    fn touch_transcript(&mut self) {
+        self.transcript_version += 1;
+    }
 }
 
 impl Renderer {
@@ -295,8 +355,11 @@ impl Renderer {
             think: None,
             think_streamed: false,
             prompt_stamp: stamp(),
+            busy_since: None,
             transient: None,
             batch: false,
+            transcript_version: 0,
+            transcript_cache: None,
         }
     }
 
@@ -533,13 +596,30 @@ impl Renderer {
         let (rows, cols) = status::terminal_size().unwrap_or((24, 80));
         let width = (cols as usize).max(1);
         let height = (rows as usize).max(1);
-        let transcript = frame::transcript_lines(&fs.items, width);
+        // Re-wrap the transcript only when it actually changed (see the
+        // `transcript_cache` field docs): a spinner tick during a quiet
+        // model/tool wait would otherwise redo O(transcript) layout work ten
+        // times a second for a frame the line differ then finds unchanged
+        // above the editor row.
+        let transcript = match &fs.transcript_cache {
+            Some((version, w, lines)) if *version == fs.transcript_version && *w == width => lines.clone(),
+            _ => {
+                let lines = frame::transcript_lines(&fs.items, width);
+                fs.transcript_cache = Some((fs.transcript_version, width, lines.clone()));
+                lines
+            }
+        };
         // Prefix the editor prompt with the timestamp when timestamps are on,
         // matching the legacy prompt so switching renderers keeps the setting.
         // Use the stamp captured at prompt start (not `stamp()`), so it stays
         // fixed while the user types rather than ticking every render.
-        let prompt = format!("{}› ", fs.prompt_stamp);
+        let prompt = format!("{}{} ", fs.prompt_stamp, prompt_glyph(fs.busy_since));
         let mut editor = frame::editor_lines(&prompt, &fs.editor.0, fs.editor.1, width);
+        // An empty editor says whose turn it is, after the cursor.
+        if fs.editor.0.is_empty() {
+            let hint = prompt_hint(fs.busy_since);
+            editor[0] = frame::fit_line(&format!("{} {DIM}{hint}{RESET}", editor[0]), width);
+        }
         if let Some(indicator) = frame::queue_indicator(fs.queued, width) {
             editor.push(indicator);
         }
@@ -566,6 +646,7 @@ impl Renderer {
                     chars: text.chars().count(),
                     seconds: started.elapsed().as_secs_f64(),
                 }));
+                fs.touch_transcript();
                 // A cancelled/failed stream can finalize accumulated reasoning
                 // here (or in `TextDelta`) without the closing `Thinking` event
                 // ever arriving. That event is the only other place the frame
@@ -598,6 +679,7 @@ impl Renderer {
                         let chars = text.trim().chars().count();
                         if chars > 0 {
                             fs.items.push(stamped(Item::Thinking { chars, seconds: started.elapsed().as_secs_f64() }));
+                            fs.touch_transcript();
                         }
                     }
                     // No pending reasoning. If deltas streamed this turn, a
@@ -608,6 +690,7 @@ impl Renderer {
                         let chars = text.trim().chars().count();
                         if chars > 0 {
                             fs.items.push(stamped(Item::Thinking { chars, seconds: 0.0 }));
+                            fs.touch_transcript();
                         }
                     }
                     None => {}
@@ -651,6 +734,7 @@ impl Renderer {
                             chars: think.chars().count(),
                             seconds: started.elapsed().as_secs_f64(),
                         }));
+                        fs.touch_transcript();
                         // The answer is starting without a closing `Thinking`
                         // event, so this finalization is the only place the
                         // streamed reasoning is consumed — cache it for legacy
@@ -670,10 +754,12 @@ impl Renderer {
                             fs.items.get_mut(i)
                         {
                             existing.push_str(text);
+                            fs.touch_transcript();
                         }
                     }
                     None => {
                         fs.items.push(stamped(Item::Message { role: Role::Assistant, text: (*text).to_string() }));
+                        fs.touch_transcript();
                         fs.stream = Some(fs.items.len() - 1);
                     }
                 }
@@ -696,11 +782,13 @@ impl Renderer {
                             && existing.as_str() != *text
                         {
                             *existing = (*text).to_string();
+                            fs.touch_transcript();
                         }
                     }
                     Some(_) => {}
                     None if !text.is_empty() => {
                         fs.items.push(stamped(Item::Message { role: Role::Assistant, text: (*text).to_string() }));
+                        fs.touch_transcript();
                     }
                     None => {}
                 }
@@ -709,6 +797,7 @@ impl Renderer {
             AgentEvent::Plan { plan } => {
                 self.frame_finish_stream(fs);
                 fs.items.push(stamped(Item::Plan((*plan).clone())));
+                fs.touch_transcript();
             }
             // Mirror the legacy renderer's user-facing filtering: plan_add /
             // plan_update are shown as the Plan checklist (the `Plan` event),
@@ -725,6 +814,7 @@ impl Renderer {
                     output: (*output).to_string(),
                     verbose: verbosity() >= Verbosity::Verbose,
                 }));
+                fs.touch_transcript();
             }
             AgentEvent::ToolCall { call }
                 if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose =>
@@ -752,12 +842,14 @@ impl Renderer {
                     }
                 };
                 fs.items.push(stamped(Item::OutcomeMark(mark)));
+                fs.touch_transcript();
             }
             AgentEvent::ToolResult { call, ok: true, .. }
                 if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
             AgentEvent::ToolCall { call } => {
                 self.frame_finish_stream(fs);
                 fs.items.push(stamped(Item::ToolCall { name: call.name.clone(), summary: tool_summary_text(call) }));
+                fs.touch_transcript();
             }
             AgentEvent::ToolResult { ok, output, .. } => {
                 fs.items.push(stamped(Item::ToolResult {
@@ -765,10 +857,12 @@ impl Renderer {
                     output: (*output).to_string(),
                     verbose: verbosity() >= Verbosity::Verbose,
                 }));
+                fs.touch_transcript();
             }
             AgentEvent::Compacted => {
                 self.frame_finish_stream(fs);
                 fs.items.push(stamped(Item::Note("⟳ context compacted".to_string())));
+                fs.touch_transcript();
             }
             // Steer/queued messages absorbed mid-turn arrive as `UserMessage`
             // events; render them in the transcript. Replaying a resumed
@@ -779,6 +873,7 @@ impl Renderer {
             AgentEvent::UserMessage { text } => {
                 self.frame_finish_stream(fs);
                 fs.items.push(stamped(Item::Message { role: Role::User, text: (*text).to_string() }));
+                fs.touch_transcript();
             }
             // The mid-turn `/model <spec>` note is printed when the command is
             // typed; the event exists so the sink records the recents MRU.
@@ -788,6 +883,7 @@ impl Renderer {
             AgentEvent::ModelSwitchFailed { spec, error } => {
                 self.frame_finish_stream(fs);
                 fs.items.push(stamped(Item::Note(format!("⚠ model switch to {spec} failed: {error}"))));
+                fs.touch_transcript();
             }
         }
         // Batched (a history replay): the caller renders once at the end —
@@ -862,6 +958,7 @@ impl Renderer {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
             fs.items.push(stamped(Item::Message { role: Role::User, text: text.to_string() }));
+            fs.touch_transcript();
             self.frame_render(fs);
         }
     }
@@ -877,6 +974,7 @@ impl Renderer {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
             fs.items.extend(items.into_iter().map(stamped));
+            fs.touch_transcript();
         }
     }
 
@@ -935,6 +1033,7 @@ impl Renderer {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
             fs.items.push(stamped(Item::Output(text.to_string())));
+            fs.touch_transcript();
             self.frame_render(fs);
             return;
         }
@@ -968,6 +1067,7 @@ impl Renderer {
         if let Some(fs) = frame.as_mut() {
             println!("{text}");
             fs.items.push(stamped(Item::Raw(text.to_string())));
+            fs.touch_transcript();
             fs.out.invalidate();
             self.frame_render(fs);
             return;
@@ -985,6 +1085,7 @@ impl Renderer {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
             fs.items.clear();
+            fs.touch_transcript();
             fs.stream = None;
             fs.think = None;
             fs.out.invalidate();
@@ -1066,6 +1167,10 @@ impl Renderer {
     pub fn begin_turn(&self) {
         // A turn starting supersedes any transient prompt-level hint.
         self.clear_transient();
+        if let Some(fs) = self.frame.lock().unwrap().as_mut() {
+            fs.busy_since = Some(Instant::now());
+            self.frame_render(fs);
+        }
         // Reset the truncation guard: it is raised only when a non-empty answer
         // delta is *actually* suppressed while quiet (see the quiet gate in
         // `event`), not merely because the turn starts quiet — a quiet turn
@@ -1102,6 +1207,17 @@ impl Renderer {
         self.touched_quiet.load(Ordering::Relaxed)
     }
 
+    /// Redraw the frame while a turn runs, so the busy spinner and elapsed
+    /// time move even when no output arrives (a long tool call or a model
+    /// still reading the prompt). A no-op at the prompt and in legacy mode.
+    pub fn tick(&self) {
+        if let Some(fs) = self.frame.lock().unwrap().as_mut()
+            && fs.busy_since.is_some()
+        {
+            self.frame_render(fs);
+        }
+    }
+
     pub fn end_turn(&self) {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
@@ -1110,6 +1226,8 @@ impl Renderer {
             // the legacy editor, which restamps on submission) so the next
             // prompt reflects the current time, then holds steady while typing.
             fs.prompt_stamp = stamp();
+            // Back to the user: the prompt glyph stops spinning.
+            fs.busy_since = None;
             // The turn is over; any transient hint no longer applies.
             fs.transient = None;
             self.frame_render(fs);
@@ -1148,6 +1266,7 @@ impl Renderer {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
             fs.items.push(stamped(Item::Note(text.to_string())));
+            fs.touch_transcript();
             self.frame_render(fs);
             return;
         }
@@ -1164,6 +1283,7 @@ impl Renderer {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
             fs.items.push(stamped(Item::Note(text.to_string())));
+            fs.touch_transcript();
             self.frame_render(fs);
             return;
         }
@@ -2136,6 +2256,96 @@ pub(crate) mod tests {
         // Clearing with no hint armed is a no-op (no redraw, no panic).
         r.clear_transient();
         assert_eq!(r.frame_transient(), None);
+    }
+
+    #[test]
+    fn the_prompt_spins_during_a_turn_and_shows_ready_after() {
+        let r = Renderer::frame_for_test();
+        let busy = |r: &Renderer| r.frame.lock().unwrap().as_ref().unwrap().busy_since;
+        assert_eq!(busy(&r), None);
+        r.begin_turn();
+        assert!(busy(&r).is_some(), "a turn marks the prompt busy");
+        r.tick();
+        r.end_turn();
+        assert_eq!(busy(&r), None, "the prompt is back to the user");
+    }
+
+    #[test]
+    fn a_spinner_tick_reuses_the_wrapped_transcript() {
+        // The 100 ms spinner tick only animates the prompt glyph/elapsed hint,
+        // so it must not re-wrap the whole transcript on every frame: the
+        // wrapped lines are cached and reused while the items are unchanged.
+        // A re-wrap would still produce the SAME lines for unchanged items, so
+        // this asserts on the cache entry the tick consults: a hit keeps the
+        // exact entry (version key and lines), proving the tick took the cache
+        // path rather than re-wrapping.
+        let cache = |r: &Renderer| r.frame.lock().unwrap().as_ref().unwrap().transcript_cache.clone();
+        let r = Renderer::frame_for_test();
+        r.event(&AgentEvent::UserMessage { text: "hello" });
+        r.begin_turn();
+        let cached = cache(&r).expect("a render populates the transcript cache");
+        r.tick();
+        let after = cache(&r).expect("the cache survives a tick");
+        assert_eq!(cached, after, "a tick with an unchanged transcript reuses the cached entry");
+    }
+
+    #[test]
+    fn the_transcript_cache_invalidates_when_items_change() {
+        let cache = |r: &Renderer| r.frame.lock().unwrap().as_ref().unwrap().transcript_cache.clone();
+        let r = Renderer::frame_for_test();
+        r.begin_turn();
+        // Streamed deltas grow the LAST item in place, keeping the item count;
+        // the version key must still invalidate, or a tick would redraw a stale
+        // transcript.
+        r.event(&AgentEvent::TextDelta { text: "one" });
+        let first = cache(&r).expect("a render populates the transcript cache");
+        r.event(&AgentEvent::TextDelta { text: " two" });
+        let second = cache(&r).unwrap();
+        assert_ne!(first.0, second.0, "an in-place streamed edit bumps the transcript version");
+        assert_ne!(first.2, second.2, "an in-place edit re-wraps the transcript");
+        // Appending an item also bumps the version and re-wraps.
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "one two" });
+        let third = cache(&r).unwrap();
+        r.end_turn();
+        r.event(&AgentEvent::UserMessage { text: "next" });
+        let fourth = cache(&r).unwrap();
+        assert_ne!(third.0, fourth.0, "appending an item bumps the transcript version");
+        assert_ne!(third.2, fourth.2, "appending an item re-wraps the transcript");
+    }
+
+    #[test]
+    fn prompt_glyph_and_hint_say_whose_turn_it_is() {
+        let idle = visible_width_text(&prompt_glyph(None));
+        assert_eq!(idle, "›");
+        assert!(prompt_hint(None).starts_with("ready"));
+        // The spinner frame follows the elapsed time.
+        let started = Instant::now() - SPINNER_INTERVAL * 3;
+        assert_eq!(visible_width_text(&prompt_glyph(Some(started))), SPINNER[3].to_string());
+        let started = Instant::now() - Duration::from_secs(65);
+        assert!(
+            prompt_hint(Some(started)).starts_with("working 1m 05s · Enter steers"),
+            "{}",
+            prompt_hint(Some(started))
+        );
+        assert_eq!(elapsed_text(Duration::from_secs(4)), "4s");
+    }
+
+    /// `text` without its ANSI colour codes.
+    fn visible_width_text(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]
