@@ -255,8 +255,12 @@ phases). Disable them with `--no-hooks`, or granularly via the
   `command`, optional `timeout_seconds` (default `bash_timeout_secs`, 600) and
   `max_output_length` (default 40,000, max 1,000,000 characters each for stdout and stderr).
   Returns stdout, then `Stderr:` and `Exit code: N` when relevant, or `(no output)`.
-  Long output keeps its head and tail with `...N bytes truncated; complete output in <path>...`;
-  the full capture stays in that file.
+  Long output keeps its head and tail with `...N bytes truncated (sha256:<digest>); complete output in <path>...`;
+  the full capture stays in that file. The digest is the first 16 hex characters (64 bits) of a
+  SHA-256 over the capture's complete content — a truncated prefix of the full `sha256sum` value,
+  hashed incrementally while the command runs (not re-read after it exits) — so two results whose
+  bounded head, tail and byte count match but whose content differs are still told apart, without
+  an unbounded post-exit reread of a multi-gigabyte capture.
 - `read_file` - Numbered lines of a text file; `path`, optional `offset` (1-based) and `limit`
   (default 2000 lines). Refuses binary files.
 - `write_file` - Create or overwrite a file (`path`, `content`), creating parent directories.
@@ -383,7 +387,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
     base URL, key source (env var, shell command, or a literal key; the file is then
     written with mode 0600) and default model
   - temperature, max tokens, system prompt
-  - **Turn cap** (`max_iterations`): LLM calls per input (0 = unbounded); a positive cap makes normal mode ask before stopping
+  - **Turn cap** (`max_iterations`): LLM calls per input (0 = unbounded); a positive cap makes normal mode ask before stopping. In a headless (non-interactive) session an unbounded cap falls back to a 300-call safety net
   - **Context**: auto-compaction on/off, threshold, compaction mode, context-window override
   - **Verbosity**
   - **Save to config file**: writes only the keys you changed into the config file
@@ -399,7 +403,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
   - **normal** - full tools; reaching a positive turn cap asks whether to keep going
   - **plan** - read-only: mutating tools (`bash`, `write_file`, `edit_file`) are gated, only analysis and output
-  - **auto** - no turn cap; a `question` left unanswered for 15s is answered with "the user is away from the keyboard, make the best decision you can"
+  - **auto** - no turn cap (headless runs still get the 300-call safety cap); a `question` left unanswered for 15s is answered with "the user is away from the keyboard, make the best decision you can"
 - `/thinking [level|default|off|reset]` - Show the thinking level in use and the levels the current model takes, or set one for this session (`reset` goes back to the configured level). See [Thinking](#thinking)
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
@@ -464,7 +468,7 @@ model = "anthropic/claude-sonnet-4-5"   # provider/model
 default_provider = "mock"               # used when the model has no known provider prefix
 temperature = 0.7                       # or "default" to send none (see Temperature below)
 max_tokens = 4096
-max_iterations = 0                      # LLM calls per user input (0 = unbounded)
+max_iterations = 0                      # LLM calls per user input (0 = unbounded; headless runs get a 300-call safety cap)
 system_prompt = "You are a helpful assistant with access to tools."
 bash_timeout_secs = 600
 persist_sessions = true
@@ -1051,7 +1055,33 @@ To turn plans off, set `plan_tools = false`.
 the result:
 - after 12 tool calls with no plan change while items are open, naming the item in progress
   (or the next one) and asking for `plan_update`; again every 12 calls;
-- once per session, after 10 tool calls in one turn with no plan, suggesting `plan_add`.
+- once per session, after 10 tool calls in one turn with no plan, suggesting `plan_add`;
+- when the model repeats the same tool call — same tool, same (normalised) arguments, same
+  result — three times in a row, telling it to change approach or report `blocked`. The
+  warning fires at most twice per turn; if the model keeps repeating after that, the turn
+  ends with a `blocked` outcome instead of burning budget, and any remaining calls in the
+  same batch are skipped rather than run. For `bash`, the match strips a trailing run of
+  read-only diagnostic pipeline stages (`| wc -l`, `| head`, `| grep …`, …) off the base
+  command (parsed quote- and escape-aware, so a `|` inside quotes or a `||` operator never
+  splits a command), so appending `| wc -l`/`| grep …`-style stages does not dodge it while
+  the stable base — which may itself contain non-diagnostic stages like `sed` — keeps
+  matching. Stripping stops at the first stage that could change state (a writer like
+  `tee`, a redirection, a write option such as `sort -o`, a shell control construct like
+  `;`/`$(…)`, or an unrecognised command), so everything to its left stays in the
+  fingerprint and genuinely different calls are never conflated. The result fingerprint
+  ignores only the per-call spill filename in the output bounder's `complete output in …`
+  marker (matched through its `...` terminator, so even a `session_dir` path with spaces is
+  normalised; not arbitrary output that merely resembles one). The marker also carries a
+  `(sha256:<digest>)` of the *complete* output, so identical runaway output is still recognised
+  while a result that changes only in its truncated middle — invisible to the bounded head,
+  tail and byte count — stays distinct and is never hard-stopped as a false repeat. The
+  fingerprint likewise folds in each attached image's content hash, so a `read_file` of a
+  changing image (whose result text is only the unchanging metadata) is told apart by the
+  bytes the model actually received. Enabled
+  plan, outcome and
+  `question` calls break the streak (so only genuinely consecutive repeats count, and an
+  interleaved such call makes the calls around it non-consecutive); when plan tools are
+  *disabled* a repeated hallucinated `plan_*` call is itself detected rather than exempted.
 
 Plan and outcome calls don't count. Set `reminders = false` to turn them off.
 

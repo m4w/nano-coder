@@ -328,7 +328,12 @@ pub fn search(path: &Path, args: &Value) -> Result<String> {
 }
 
 /// `history_read`: one message in full (bounded, with the whole spilled).
-pub fn read(path: &Path, args: &Value, spill_dir: &Path) -> Result<String> {
+/// Also returns the spill's [`Spill`](crate::output::Spill) identity (digest +
+/// exact marker path) when it was truncated and spilled, so the caller can hand
+/// the spill's identity to the loop detector **out of band** instead of the
+/// detector re-parsing the rendered marker (issue #65). The spill is `None`
+/// when nothing spilled.
+pub fn read_digest(path: &Path, args: &Value, spill_dir: &Path) -> Result<(String, Option<crate::output::Spill>)> {
     let id = id_arg(args, "id")?.ok_or_else(|| anyhow!("id is required"))?;
     let limit = crate::output::parse_max_output_length(args.get("max_output_length")).map_err(|e| anyhow!(e))?;
     let messages = load(path)?;
@@ -367,7 +372,7 @@ pub fn read(path: &Path, args: &Value, spill_dir: &Path) -> Result<String> {
     for attachment in &message.attachments {
         text.push_str(&format!("\n{}", attachment.placeholder()));
     }
-    Ok(crate::output::bound_and_spill(&text, limit, spill_dir, &format!("history-{id}.txt")))
+    Ok(crate::output::bound_and_spill_digest(&text, limit, spill_dir, &format!("history-{id}.txt")))
 }
 
 #[cfg(test)]
@@ -416,7 +421,7 @@ mod tests {
         let mut log = SessionLog::create(dir.path(), "t").unwrap();
         let thought = Message { thinking: "check auth.rs first".into(), ..Message::assistant("on it") };
         log.append(&Record::Message(Box::new(thought))).unwrap();
-        let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
+        let out = read_digest(log.path(), &json!({"id": 2}), dir.path()).unwrap().0;
         assert!(out.contains("[thinking] check auth.rs first\non it"), "{out}");
     }
 
@@ -514,16 +519,16 @@ mod tests {
     fn read_returns_one_message_whole_or_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let path = log(dir.path());
-        let out = read(&path, &json!({"id": 5}), dir.path()).unwrap();
+        let out = read_digest(&path, &json!({"id": 5}), dir.path()).unwrap().0;
         assert!(out.starts_with("#5 tool bash (failed)") && out.contains("auth.rs:42") && out.ends_with(" b"), "{out}");
-        let out = read(&path, &json!({"id": "#4"}), dir.path()).unwrap();
+        let out = read_digest(&path, &json!({"id": "#4"}), dir.path()).unwrap().0;
         assert!(out.contains("[called bash id=c1 {\"command\":\"cargo test auth\"}]"), "{out}");
-        let out = read(&path, &json!({"id": 5, "max_output_length": 100}), dir.path()).unwrap();
+        let out = read_digest(&path, &json!({"id": 5, "max_output_length": 100}), dir.path()).unwrap().0;
         assert!(out.contains("complete output in"), "{out}");
-        let err = read(&path, &json!({"id": 99}), dir.path()).unwrap_err();
+        let err = read_digest(&path, &json!({"id": 99}), dir.path()).unwrap_err();
         assert!(err.to_string().contains("latest is #6"), "{err}");
         // System messages are not readable, matching search's exclusion.
-        let err = read(&path, &json!({"id": 2}), dir.path()).unwrap_err();
+        let err = read_digest(&path, &json!({"id": 2}), dir.path()).unwrap_err();
         assert!(err.to_string().contains("system message"), "{err}");
     }
 
@@ -535,7 +540,7 @@ mod tests {
         thinker.thinking_blocks =
             vec![json!({"type": "thinking", "thinking": "weigh the options", "signature": "sig"})];
         log.append(&Record::Message(Box::new(thinker))).unwrap();
-        let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
+        let out = read_digest(log.path(), &json!({"id": 2}), dir.path()).unwrap().0;
         assert!(out.contains("[thinking] weigh the options"), "{out}");
     }
 
@@ -549,7 +554,7 @@ mod tests {
         let mut thinker = Message { thinking: "check auth.rs first".into(), ..Message::assistant("on it") };
         thinker.thinking_blocks = vec![json!({"type": "reasoning_content", "text": "check auth.rs first"})];
         log.append(&Record::Message(Box::new(thinker))).unwrap();
-        let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
+        let out = read_digest(log.path(), &json!({"id": 2}), dir.path()).unwrap().0;
         assert!(out.contains("[thinking] check auth.rs first\non it"), "{out}");
     }
 
