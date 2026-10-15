@@ -54,6 +54,13 @@ pub enum Record {
         /// Reported with `report_outcome` during the turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outcome: Option<crate::goal::Outcome>,
+        /// Why the turn stopped. Omitted for a clean `EndTurn` (the common
+        /// case) to keep logs small; older records without it restore to
+        /// `EndTurn`. A truncated turn (`MaxTokens`) is persisted so a
+        /// redelivered input replays the truncated stop reason instead of
+        /// reporting a clean finish (issue #114).
+        #[serde(default, skip_serializing_if = "crate::agent::StopReason::is_end_turn")]
+        stop_reason: crate::agent::StopReason,
         /// `history_search` / `history_read` calls made during the turn.
         #[serde(default, skip_serializing_if = "is_zero")]
         history_calls: u32,
@@ -75,6 +82,14 @@ pub enum Record {
         /// Compaction only: the `provider/model` in use, for comparing modes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// The in-flight output-limit continuation state (answer text + count)
+        /// of a pending input that survives this replacement, captured because
+        /// the truncated chunks it was built from may be folded into the
+        /// summary. Restored into the pending input so a post-compaction crash
+        /// still rebuilds the whole answer and the turn-wide count (issue
+        /// #114). Absent when no continuation is in flight.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuation: Option<(String, usize)>,
         recorded_at: DateTime<FixedOffset>,
     },
     /// The task plan after a change; the latest one wins.
@@ -107,6 +122,29 @@ pub struct PendingInput {
     /// Conversation length when the input was accepted; its user message, if
     /// recorded, is at this index.
     pub position: usize,
+    /// In-flight output-limit continuation state for this turn: the answer text
+    /// accumulated across cut-off chunks so far, and how many continuations
+    /// have run. Persisted (via the `Replace` record) so a crash after a
+    /// mid-turn compaction — which folds the truncated chunks into the summary
+    /// — still restores the answer prefix and the turn-wide continuation count,
+    /// instead of losing both with the folded messages (issue #114). `None`
+    /// when no continuation is in flight.
+    pub continuation: Option<(String, usize)>,
+    /// The conversation length up to which the `continuation` snapshot already
+    /// accounts — the replay boundary. Recovery replays only the messages
+    /// logged *after* this boundary over the persisted snapshot, so chunks and
+    /// reminders already folded into it are not replayed a second time (and the
+    /// answer prefix / continuation budget are not doubled), while chunks logged
+    /// *after* it are still recovered (issue #114).
+    ///
+    /// It is set two ways: at a mid-turn compaction it is the index past the
+    /// folded, summarized messages (persisted into the `Replace` record and
+    /// restored on decode); and, for the live in-memory pending input, it is
+    /// advanced in lockstep with the snapshot on every `sync_pending_continuation`
+    /// so a same-Agent error/retry replays nothing already folded in. `None`
+    /// (persisted path, no compaction) means recovery replays from the input
+    /// `position` with an empty snapshot.
+    pub continuation_base: Option<usize>,
 }
 
 /// State rebuilt from a session log.
@@ -117,6 +155,11 @@ pub struct Restored {
     pub completed: HashMap<String, String>,
     /// Outcomes reported by completed inputs, by input ID.
     pub outcomes: HashMap<String, crate::goal::Outcome>,
+    /// Non-`EndTurn` stop reasons for completed inputs, by input ID, so a
+    /// redelivered input replays how its turn actually ended (e.g. a truncated
+    /// `MaxTokens` turn) instead of a clean finish (issue #114). Clean turns are
+    /// absent (treated as `EndTurn`).
+    pub stop_reasons: HashMap<String, crate::agent::StopReason>,
     /// An input accepted but not completed before the log ended.
     pub pending_input: Option<PendingInput>,
     pub plan: Option<crate::plan::Plan>,
@@ -413,7 +456,13 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
             }
             _ if index == 0 => bail!("session log does not start with a session header"),
             Record::Input { id, text, .. } => {
-                restored.pending_input = Some(PendingInput { id, text, position: restored.conversation.len() });
+                restored.pending_input = Some(PendingInput {
+                    id,
+                    text,
+                    position: restored.conversation.len(),
+                    continuation: None,
+                    continuation_base: None,
+                });
             }
             Record::Message(mut message) => {
                 // A direct record's ID is its physical line (`history_read`
@@ -428,7 +477,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 originals.push((*message).clone());
                 restored.conversation.push(*message);
             }
-            Record::TurnEnd { input_id, response, outcome, .. } => {
+            Record::TurnEnd { input_id, response, outcome, stop_reason, .. } => {
                 if restored.pending_input.as_ref().is_some_and(|p| p.id == input_id) {
                     restored.pending_input = None;
                 }
@@ -436,13 +485,34 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                     Some(outcome) => restored.outcomes.insert(input_id.clone(), outcome),
                     None => restored.outcomes.remove(&input_id),
                 };
+                // Replay the persisted stop reason so a redelivered input that
+                // truncated (`MaxTokens`) is not reported as a clean finish.
+                // Older records deserialize `stop_reason` as `EndTurn`, so this
+                // overwrites to the default for a clean turn and keeps the map
+                // honest when an ID is reused (issue #114).
+                if stop_reason.is_end_turn() {
+                    restored.stop_reasons.remove(&input_id);
+                } else {
+                    restored.stop_reasons.insert(input_id.clone(), stop_reason);
+                }
                 restored.completed.insert(input_id, response);
             }
-            Record::Replace { mut messages, pending_position, summarized, mode, .. } => {
+            Record::Replace { mut messages, pending_position, summarized, mode, continuation, .. } => {
                 backfill_log_lines(&mut messages, &originals, summarized);
                 restored.conversation = messages;
                 restored.pending_input = match (restored.pending_input.take(), pending_position) {
-                    (Some(pending), Some(position)) => Some(PendingInput { position, ..pending }),
+                    // Restore the persisted continuation state too: the chunks it
+                    // was built from may have been folded into the summary, so
+                    // the conversation alone no longer holds them (issue #114).
+                    // The boundary is the restored (compacted) conversation
+                    // length, so recovery replays only post-compaction messages
+                    // over the snapshot.
+                    (Some(pending), Some(position)) => Some(PendingInput {
+                        position,
+                        continuation,
+                        continuation_base: Some(restored.conversation.len()),
+                        ..pending
+                    }),
                     _ => None,
                 };
                 // A smart compaction offers the history tools; restore that
@@ -520,9 +590,45 @@ mod tests {
             input_id: id.into(),
             response: "hello".into(),
             outcome: None,
+            stop_reason: crate::agent::StopReason::EndTurn,
             history_calls: 0,
             recorded_at: now(),
         }
+    }
+
+    #[test]
+    fn turn_end_persists_a_truncated_stop_reason_and_defaults_old_records() {
+        // A truncated (`MaxTokens`) turn persists its stop reason so a resume
+        // replays it; a clean turn omits the field, and an older record without
+        // it restores to `EndTurn` (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "sr").unwrap();
+        log.append(&input("in-1")).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("hi")))).unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant("partial")))).unwrap();
+        log.append(&Record::TurnEnd {
+            input_id: "in-1".into(),
+            response: "partial".into(),
+            outcome: None,
+            stop_reason: crate::agent::StopReason::MaxTokens,
+            history_calls: 0,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+
+        let (_, restored) = SessionLog::open(dir.path(), "sr").unwrap();
+        assert_eq!(restored.stop_reasons.get("in-1"), Some(&crate::agent::StopReason::MaxTokens));
+
+        // A clean `EndTurn` is omitted from the serialized record…
+        let clean = serde_json::to_string(&turn_end("in-1")).unwrap();
+        assert!(!clean.contains("stop_reason"), "a clean stop reason is not serialized: {clean}");
+        // …and an older record with no `stop_reason` field restores to `EndTurn`.
+        let old: Record =
+            serde_json::from_str(r#"{"type":"turn_end","data":{"input_id":"in-9","response":"ok","recorded_at":"2026-01-01T00:00:00+00:00"}}"#)
+                .unwrap();
+        let Record::TurnEnd { stop_reason, .. } = old else { panic!("expected a TurnEnd") };
+        assert_eq!(stop_reason, crate::agent::StopReason::EndTurn);
     }
 
     #[test]
@@ -576,7 +682,16 @@ mod tests {
         let (_, restored) = SessionLog::open(dir.path(), "s1").unwrap();
         assert_eq!(restored.conversation.len(), 4);
         assert_eq!(restored.completed.get("in-1").map(String::as_str), Some("hello"));
-        assert_eq!(restored.pending_input, Some(PendingInput { id: "in-2".into(), text: "hi".into(), position: 3 }));
+        assert_eq!(
+            restored.pending_input,
+            Some(PendingInput {
+                id: "in-2".into(),
+                text: "hi".into(),
+                position: 3,
+                continuation: None,
+                continuation_base: None
+            })
+        );
         assert!(SessionLog::create(dir.path(), "s1").is_err(), "create must not clobber");
     }
 
@@ -591,6 +706,7 @@ mod tests {
             summarized: None,
             mode: None,
             model: None,
+            continuation: None,
             recorded_at: now(),
         })
         .unwrap();
@@ -621,6 +737,7 @@ mod tests {
             summarized: None,
             mode: None,
             model: None,
+            continuation: None,
             recorded_at: now(),
         })
         .unwrap();
@@ -645,6 +762,7 @@ mod tests {
             summarized: None,
             mode: None,
             model: None,
+            continuation: None,
             recorded_at: now(),
         })
         .unwrap();
@@ -654,7 +772,16 @@ mod tests {
         let mut expected = messages.clone();
         expected[2].log_line = Some(3);
         assert_eq!(restored.conversation, expected);
-        assert_eq!(restored.pending_input, Some(PendingInput { id: "in-1".into(), text: "go".into(), position: 2 }));
+        assert_eq!(
+            restored.pending_input,
+            Some(PendingInput {
+                id: "in-1".into(),
+                text: "go".into(),
+                position: 2,
+                continuation: None,
+                continuation_base: Some(3)
+            })
+        );
     }
 
     #[test]
@@ -674,6 +801,7 @@ mod tests {
             summarized: Some((2, 4)),
             mode: Some(crate::config::CompactionMode::Smart),
             model: None,
+            continuation: None,
             recorded_at: now(),
         })
         .unwrap();
@@ -745,6 +873,7 @@ mod tests {
             summarized: Some((2, 2)),
             mode: Some(crate::config::CompactionMode::Standard),
             model: None,
+            continuation: None,
             recorded_at: now(),
         })
         .unwrap();
@@ -764,6 +893,7 @@ mod tests {
             summarized: Some((2, 2)),
             mode: Some(crate::config::CompactionMode::Smart),
             model: None,
+            continuation: None,
             recorded_at: now(),
         })
         .unwrap();
@@ -802,6 +932,7 @@ mod tests {
             summarized: None,
             mode: None,
             model: None,
+            continuation: None,
             recorded_at: now(),
         })
         .unwrap();

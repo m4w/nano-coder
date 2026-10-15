@@ -40,6 +40,35 @@ pub const CANCELLED_RESPONSE: &str = "[turn cancelled]";
 /// finite safety net instead (issue #65).
 const HEADLESS_SAFETY_CAP: usize = 300;
 
+/// How many times a turn re-prompts a model whose reply was cut off at the
+/// output-token limit before giving up and ending the turn with a `MaxTokens`
+/// stop reason. Keeps a model that keeps overrunning from looping forever while
+/// still giving it a few chances to continue in smaller pieces.
+const MAX_TRUNCATED_CONTINUATIONS: usize = 3;
+
+/// Fallback `max_tokens` when the user configured none and the endpoint
+/// published no output limit. Much larger than the old arbitrary 4096 default,
+/// which cut long replies (whole-file writes) off mid-call; still an explicit
+/// value, since Anthropic requires one and some OpenAI-compatible proxies apply
+/// a small default when it is omitted.
+const DEFAULT_MAX_OUTPUT_TOKENS: i64 = 32_768;
+
+/// The nudge sent when a reply was cut off at the output-token limit, asking the
+/// model to continue in smaller pieces rather than ending the turn.
+fn truncated_continuation_note(completion_tokens: i64) -> String {
+    let at = if completion_tokens > 0 {
+        format!(" at the output-token limit ({completion_tokens} tokens)")
+    } else {
+        " at the output-token limit".to_string()
+    };
+    format!(
+        "Your previous reply was cut off{at}; any tool call in it was not run. \
+         Continue from where you left off, and write large outputs in smaller pieces \
+         (e.g. `write_file` a skeleton, then `edit_file` to fill it in) so each reply \
+         fits within the limit."
+    )
+}
+
 /// Output room `request_max_tokens()` tries to keep free within the context
 /// window, and the reservation `over_threshold()` compacts against. It is a
 /// target, not a floor: when fewer tokens actually remain and pre-send
@@ -214,11 +243,18 @@ pub struct Steer {
 }
 
 /// Why a turn ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReason {
+    #[default]
     EndTurn,
     Cancelled,
     MaxTurnRequests,
+    /// The model's reply was cut off at the output-token limit and kept being
+    /// cut off across the continuation cap, so the turn ended without a clean
+    /// finish. Distinct from `EndTurn` so callers (ACP) can tell a truncated
+    /// turn apart from a finished one.
+    MaxTokens,
 }
 
 impl StopReason {
@@ -228,7 +264,15 @@ impl StopReason {
             StopReason::EndTurn => "end_turn",
             StopReason::Cancelled => "cancelled",
             StopReason::MaxTurnRequests => "max_turn_requests",
+            StopReason::MaxTokens => "max_tokens",
         }
+    }
+
+    /// Whether this is the default clean finish. Used to keep the session log
+    /// quiet: only a non-`EndTurn` stop reason is serialized on a `TurnEnd`
+    /// record, and older records without the field restore to `EndTurn`.
+    pub(crate) fn is_end_turn(&self) -> bool {
+        matches!(self, StopReason::EndTurn)
     }
 }
 
@@ -569,6 +613,11 @@ pub struct Agent {
     completed_inputs: HashMap<String, String>,
     /// Outcomes reported by completed inputs, by input ID.
     completed_outcomes: HashMap<String, Outcome>,
+    /// Non-`EndTurn` stop reasons of completed inputs, by input ID, so a
+    /// redelivered input replays how its turn actually ended — e.g. a truncated
+    /// `MaxTokens` turn — instead of a clean `EndTurn` (issue #114). Clean turns
+    /// are absent.
+    completed_stop_reasons: HashMap<String, StopReason>,
     /// An input that was accepted but whose turn never finished (crash, kill, or error).
     pending_input: Option<PendingInput>,
     input_counter: u64,
@@ -577,6 +626,12 @@ pub struct Agent {
     /// status-line update, to interleave a mid-update `/thinking` change.
     #[cfg(test)]
     after_thinking_snapshot: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Test-only hook fired right after a length-truncated chunk schedules its
+    /// continuation reminder, to interleave a steer landing *between*
+    /// continuation requests — after the post-response steer check, before the
+    /// next iteration absorbs it (issue #114).
+    #[cfg(test)]
+    after_continuation_scheduled: Option<Box<dyn Fn() + Send + Sync>>,
     message_counter: u64,
     control: TurnControl,
     stats: SharedStats,
@@ -585,6 +640,13 @@ pub struct Agent {
     calibration: Option<(usize, usize)>,
     /// Window learned from a context-overflow error (until the model changes).
     learned_window: Option<usize>,
+    /// Output-token cap learned from an output-limit rejection error, used
+    /// until the model changes. With automatic `max_tokens` an unlisted model
+    /// whose real cap is below `DEFAULT_MAX_OUTPUT_TOKENS` would otherwise be
+    /// rejected every request until a background `/model`-switch probe lands;
+    /// learning the cap from the first rejection lets the retry succeed without
+    /// blocking the switch on the probe (issue #114).
+    learned_max_output: Option<usize>,
     /// Window reported by the endpoint (see `detect_context_window`). Shared
     /// and locked because a mid-turn `/model` switch probes in a background
     /// task (see `detect_context_window_for_switch`), which publishes here
@@ -602,6 +664,14 @@ pub struct Agent {
     /// Vision capability reported by the endpoint (see `detect_context_window`).
     /// Shared for the same reason as `detected_window`.
     reported_vision: std::sync::Arc<std::sync::Mutex<Option<crate::vision::Vision>>>,
+    /// The model's own maximum output tokens as published by the endpoint,
+    /// captured on **both** probe paths — the default combined probe and the
+    /// configured-window path (which skips the window follow-up but still reads
+    /// the shared `/models` entry that carries this limit). Kept separate from
+    /// `detected_window` so a configured context window — which clears the
+    /// detected window — never discards the discovered output limit (issue
+    /// #114). Shared for the same reason as `detected_window`.
+    reported_max_output: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
     /// Context size right after the last compaction; auto-compaction waits
     /// for real growth past it so an incompressible context is not
     /// re-summarized on every call.
@@ -722,6 +792,7 @@ struct DetectSlots {
     window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>,
     thinking: std::sync::Arc<std::sync::Mutex<Option<crate::thinking::Reported>>>,
     vision: std::sync::Arc<std::sync::Mutex<Option<crate::vision::Vision>>>,
+    max_output: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
 }
 
 /// What a background capability probe found.
@@ -729,13 +800,16 @@ struct Detected {
     window: Option<DetectedWindow>,
     thinking: Option<crate::thinking::Reported>,
     vision: Option<crate::vision::Vision>,
+    /// The model's published output-token limit, kept separate from `window`
+    /// so a configured window (which carries none) never discards it (#114).
+    max_output: Option<usize>,
 }
 
 #[cfg(test)]
 impl Detected {
     /// A probe that reported only a window.
     fn window(window: DetectedWindow) -> Self {
-        Detected { window: Some(window), thinking: None, vision: None }
+        Detected { window: Some(window), thinking: None, vision: None, max_output: None }
     }
 }
 
@@ -743,7 +817,7 @@ impl Detected {
 impl DetectSlots {
     /// Slots around an existing window slot, with fresh thinking/vision slots.
     fn window(window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>) -> Self {
-        DetectSlots { window, thinking: Default::default(), vision: Default::default() }
+        DetectSlots { window, thinking: Default::default(), vision: Default::default(), max_output: Default::default() }
     }
 }
 
@@ -769,20 +843,25 @@ impl Agent {
             session_id: None,
             completed_inputs: HashMap::new(),
             completed_outcomes: HashMap::new(),
+            completed_stop_reasons: HashMap::new(),
             pending_input: None,
             input_counter: 0,
             event_sink: None,
             #[cfg(test)]
             after_thinking_snapshot: None,
+            #[cfg(test)]
+            after_continuation_scheduled: None,
             message_counter: 0,
             control: TurnControl::default(),
             stats: SharedStats::default(),
             calibration: None,
             learned_window: None,
+            learned_max_output: None,
             detected_window: std::sync::Arc::new(std::sync::Mutex::new(None)),
             detect_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reported_thinking: std::sync::Arc::new(std::sync::Mutex::new(None)),
             reported_vision: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            reported_max_output: std::sync::Arc::new(std::sync::Mutex::new(None)),
             compact_floor: 0,
             streaming: false,
             instructions: None,
@@ -1290,6 +1369,7 @@ impl Agent {
         self.client = client;
         self.calibration = None;
         self.learned_window = None;
+        self.learned_max_output = None;
         *self.detected_window.lock().unwrap() = None;
         *self.reported_thinking.lock().unwrap() = None;
         self.compact_floor = 0;
@@ -1429,6 +1509,7 @@ impl Agent {
                     self.config.model = spec.clone();
                     self.calibration = None;
                     self.learned_window = None;
+                    self.learned_max_output = None;
                     *self.detected_window.lock().unwrap() = None;
                     self.compact_floor = 0;
                     self.detect_context_window_for_switch();
@@ -1460,6 +1541,7 @@ impl Agent {
         // and cannot overwrite what this blocking detect establishes.
         self.detect_generation.fetch_add(1, Ordering::SeqCst);
         *self.detected_window.lock().unwrap() = None;
+        *self.reported_max_output.lock().unwrap() = None;
         if self.configured_window().is_some() {
             // The configured window wins, so the window half of the combined
             // probe is discarded — running it anyway can only hurt: a
@@ -1472,7 +1554,15 @@ impl Agent {
             return;
         }
         let probe = self.client.detect_capabilities();
-        let (window, thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
+        let (window, thinking, vision, max_output) =
+            tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
+        // Capture the published output limit separately so it survives even
+        // when the detected window is `None` (an entry can publish an output
+        // cap with no recognized window field) or when a later configured
+        // window clears the detected window (issue #114). Fall back to the
+        // window's own cap when the probe returns none independently.
+        *self.reported_max_output.lock().unwrap() =
+            max_output.or_else(|| window.as_ref().and_then(|w| w.max_output_tokens));
         *self.detected_window.lock().unwrap() = window;
         *self.reported_thinking.lock().unwrap() = thinking;
         // Vision is derived from the same probe responses `detect_capabilities`
@@ -1500,9 +1590,12 @@ impl Agent {
     /// limits), mirroring `detect_context_window` on the default path.
     async fn detect_thinking(&mut self) {
         let probe = self.client.detect_thinking_and_vision();
-        let (thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
+        let (thinking, vision, max_output) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
         *self.reported_thinking.lock().unwrap() = thinking;
         *self.reported_vision.lock().unwrap() = vision;
+        // The output limit is a separate budget from the window, so keep it even
+        // though the configured window wins over the probed one (issue #114).
+        *self.reported_max_output.lock().unwrap() = max_output;
         self.refresh_stats();
     }
 
@@ -1663,6 +1756,7 @@ impl Agent {
         // the background probe lands, the built-in assumptions apply.
         *self.reported_thinking.lock().unwrap() = None;
         *self.reported_vision.lock().unwrap() = None;
+        *self.reported_max_output.lock().unwrap() = None;
         // Publish the new model's fallback stats (provider/model name + the
         // model-name or default window) right away, so a slow or `None` probe
         // cannot leave the UI on the previous model's window.
@@ -1675,22 +1769,31 @@ impl Agent {
             window: self.detected_window.clone(),
             thinking: self.reported_thinking.clone(),
             vision: self.reported_vision.clone(),
+            max_output: self.reported_max_output.clone(),
         };
         let sink = self.event_sink.clone();
         let stats = self.stats.clone();
         let current = self.detect_generation.clone();
         tokio::spawn(async move {
-            let (detected, thinking, vision) = if configured {
-                let (thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe.detect_thinking_and_vision())
-                    .await
-                    .ok()
-                    .unwrap_or_default();
-                (None, thinking, vision)
+            let (detected, thinking, vision, max_output) = if configured {
+                let (thinking, vision, max_output) =
+                    tokio::time::timeout(DETECT_TIMEOUT, probe.detect_thinking_and_vision())
+                        .await
+                        .ok()
+                        .unwrap_or_default();
+                (None, thinking, vision, max_output)
             } else {
-                tokio::time::timeout(DETECT_TIMEOUT, probe.detect_capabilities()).await.ok().unwrap_or_default()
+                let (window, thinking, vision, probed_max_output) =
+                    tokio::time::timeout(DETECT_TIMEOUT, probe.detect_capabilities()).await.ok().unwrap_or_default();
+                // Carry the published output limit forward separately: it
+                // survives even when the detected window is `None` (an entry
+                // can publish an output cap with no window field), falling back
+                // to the window's own cap when the probe returns none (issue #114).
+                let max_output = probed_max_output.or_else(|| window.as_ref().and_then(|w| w.max_output_tokens));
+                (window, thinking, vision, max_output)
             };
             Self::finish_detect(
-                Detected { window: detected, thinking, vision },
+                Detected { window: detected, thinking, vision, max_output },
                 generation,
                 current,
                 slots,
@@ -1723,7 +1826,7 @@ impl Agent {
         sink: Option<EventSink>,
         stats: SharedStats,
     ) {
-        let Detected { window: detected, thinking, vision } = detected;
+        let Detected { window: detected, thinking, vision, max_output } = detected;
         {
             // Check the generation under the window slot lock so a switch
             // racing this completion either bumps it before we read (we
@@ -1736,6 +1839,9 @@ impl Agent {
             }
             *slots.thinking.lock().unwrap() = thinking;
             *slots.vision.lock().unwrap() = vision;
+            // Published output limit lands with the rest; kept even when the
+            // window slot stays empty (configured-window path) (issue #114).
+            *slots.max_output.lock().unwrap() = max_output;
             if let Some(detected) = &detected {
                 *slot = Some(detected.clone());
             }
@@ -1839,6 +1945,138 @@ impl Agent {
             (None, Some(learned)) => Some(learned),
             (None, None) => None,
         }
+    }
+
+    /// Forward-replay the in-flight output-limit continuation state for a turn
+    /// being recovered after a crash, converging on the same `(answer, count)`
+    /// the live loop held when it was interrupted (issue #114).
+    ///
+    /// Starts from `snapshot` — the answer text + continuation count persisted
+    /// into a mid-turn compaction's `Replace` record, or empty when no
+    /// compaction intervened — and walks `tail`, the turn's messages logged
+    /// *after* that snapshot, in forward order:
+    ///
+    /// - a *continuation reminder* (`continuation`) counts one scheduled
+    ///   continuation: the budget tracks scheduled reminders, matching the live
+    ///   loop (which increments the count *before* pushing the reminder), not
+    ///   truncated replies — the two diverge when the crash lands after a
+    ///   truncated chunk but before its reminder is logged;
+    /// - any *other* user message (a steer, a Stop-hook re-prompt, the restated
+    ///   pending input) begins a new answer segment, so the accumulated prefix
+    ///   resets;
+    /// - a length-truncated plain assistant chunk extends the answer;
+    /// - any other assistant message (a tool call, or a clean reply) and any
+    ///   tool result begins a new segment, so the prefix resets (its tool-call
+    ///   markup must never leak into the text answer).
+    ///
+    /// The count is turn-wide — a tool run clears the answer accumulator but
+    /// still spends the budget — so it is only ever incremented, never reset;
+    /// only the answer text resets at a segment boundary.
+    fn replay_continuation(snapshot: Option<(String, usize)>, tail: &[Message]) -> (String, usize) {
+        let (mut answer, mut count) = snapshot.unwrap_or_default();
+        for msg in tail {
+            match msg.role {
+                Role::User if msg.continuation => count += 1,
+                Role::User => answer.clear(),
+                Role::Assistant
+                    if msg.tool_calls.is_empty() && crate::llm::stop_reason_is_length(msg.stop_reason.as_deref()) =>
+                {
+                    answer.push_str(&msg.content);
+                }
+                Role::Assistant | Role::Tool => answer.clear(),
+                Role::System => {}
+            }
+        }
+        (answer, count)
+    }
+
+    /// Mirror the live output-limit continuation state into the pending input,
+    /// so a mid-turn compaction captures it into the durable `Replace` record
+    /// and a post-compaction crash still restores the answer prefix and the
+    /// turn-wide count (issue #114). Cleared (`None`) when no continuation is
+    /// in flight.
+    fn sync_pending_continuation(&mut self, continued_answer: &str, truncated_continuations: usize) {
+        // Snapshot the current conversation length before the `&mut` borrow:
+        // it is the new replay boundary (see below).
+        let boundary = self.conversation.len();
+        if let Some(pending) = self.pending_input.as_mut() {
+            pending.continuation = (!continued_answer.is_empty() || truncated_continuations > 0)
+                .then(|| (continued_answer.to_string(), truncated_continuations));
+            // Advance the replay boundary in lockstep with the snapshot. The
+            // snapshot now accounts for *every* message logged so far, so a
+            // same-Agent retry (a provider error leaves the turn pending and the
+            // same input id is re-run on this live Agent) must replay only the
+            // messages logged *after* this point. Leaving the boundary stale
+            // would re-replay chunks and reminders already folded into the
+            // snapshot — duplicating the answer prefix and double-counting the
+            // continuation budget (issue #114).
+            pending.continuation_base = Some(boundary);
+        }
+    }
+
+    /// The base `max_tokens` for the next request before the context-window
+    /// clamp: an explicit configured value overrides everything; otherwise the
+    /// model's own published output limit (from the endpoint's capabilities),
+    /// falling back to a large built-in value when none is published (issue
+    /// #114). Never the old arbitrary 4096 default, which cut long replies off.
+    fn output_token_base(&self) -> i64 {
+        let base = self.output_token_base_uncapped();
+        // A cap learned from an earlier output-limit rejection is an observed
+        // hard ceiling for this model; never send above it, even over a
+        // configured value, so the request stays valid until the model changes
+        // (issue #114).
+        match self.learned_max_output {
+            Some(cap) => base.min(cap as i64),
+            None => base,
+        }
+    }
+
+    /// `output_token_base` before the learned-cap clamp.
+    fn output_token_base_uncapped(&self) -> i64 {
+        let configured = self.config.max_tokens;
+        if configured > 0 {
+            return i64::from(configured);
+        }
+        if let Some(limit) = self.detected_max_output() {
+            return limit as i64;
+        }
+        // No endpoint-published limit: before the large unknown-model fallback,
+        // honour a known output cap for this model (e.g. native OpenAI
+        // `gpt-4o-mini`, whose 16,384 cap `/models` does not expose). Sending
+        // the 32,768 fallback to such a model with a short prompt would exceed
+        // its real cap and be rejected (issue #114). Check the live client's
+        // model name as well as the configured one so a `/model` switch counts.
+        if let Some(limit) = context::output_limit_for_model(&self.config.model)
+            .or_else(|| context::output_limit_for_model(self.client.model_name()))
+        {
+            return limit as i64;
+        }
+        DEFAULT_MAX_OUTPUT_TOKENS
+    }
+
+    /// The model's own maximum output tokens as reported by the endpoint's
+    /// capabilities probe, if any. `None` when unconfigured and unpublished.
+    /// Read from the standalone report (populated on *both* the default and the
+    /// configured-window probe paths), falling back to the detected window's
+    /// copy, so a configured context window never suppresses the discovered
+    /// output limit (issue #114).
+    fn detected_max_output(&self) -> Option<usize> {
+        // Copy the reported value out so its guard is released *before* locking
+        // `detected_window`. `finish_detect` takes these locks in the opposite
+        // order — window first, then `max_output` — so holding the report guard
+        // across the window lock here inverts that order and can deadlock a
+        // background model-switch probe when the report is still `None`
+        // (issue #114).
+        let reported = *self.reported_max_output.lock().unwrap();
+        reported.or_else(|| self.detected_window.lock().unwrap().as_ref().and_then(|d| d.max_output_tokens))
+    }
+
+    /// The effective `max_tokens` the next request would send before the
+    /// context-window clamp: the configured override, else the model's own
+    /// published output limit, else the built-in fallback. For display and ACP
+    /// reporting (the raw `config.max_tokens` is `0` when unset).
+    pub fn effective_max_tokens(&self) -> i64 {
+        self.output_token_base()
     }
 
     /// The context window and where it came from, for `/context`.
@@ -2039,14 +2277,20 @@ impl Agent {
         self.apply_mode_to_system_prompt();
     }
 
-    /// Add queued steering messages to the conversation.
-    fn absorb_steers(&mut self) -> Result<()> {
+    /// Pull any queued steer messages into the conversation. Returns whether at
+    /// least one steer was absorbed, so the caller can reset the output-limit
+    /// continuation accumulator: an absorbed steer begins a new answer segment,
+    /// and the discarded cut-off prefix must not be carried into the revised
+    /// answer (issue #114).
+    fn absorb_steers(&mut self) -> Result<bool> {
+        let mut absorbed = false;
         for steer in self.control.take_pending() {
             self.push(Message::user(&steer.text))?;
             self.emit(AgentEvent::UserMessage { text: &steer.text });
             self.control.inner.absorbed.lock().unwrap().push(steer);
+            absorbed = true;
         }
-        Ok(())
+        Ok(absorbed)
     }
 
     pub fn set_streaming(&mut self, streaming: bool) {
@@ -2271,6 +2515,7 @@ impl Agent {
         self.control.set_thinking(None);
         self.completed_inputs.clear();
         self.completed_outcomes.clear();
+        self.completed_stop_reasons.clear();
         self.pending_input = None;
         self.plan = Plan::default();
         self.reminders = Reminders::new(self.config.outcome_tool);
@@ -2351,6 +2596,7 @@ impl Agent {
         }
         self.completed_inputs = restored.completed;
         self.completed_outcomes = restored.outcomes;
+        self.completed_stop_reasons = restored.stop_reasons;
         self.pending_input = restored.pending_input;
         self.plan = restored.plan.unwrap_or_default();
         // Reminders belong to the session being left (`/resume` mid-process).
@@ -2480,6 +2726,11 @@ impl Agent {
                 // (which can be a bare model name under a default provider), so
                 // mode comparisons keep the provider dimension.
                 model: mode.map(|_| format!("{}/{}", self.client.provider_name(), self.client.model_name())),
+                // Persist the surviving pending input's in-flight continuation
+                // state: the truncated chunks it was built from may be folded
+                // into the summary, so without this a post-compaction crash
+                // loses the answer prefix and resets the count (issue #114).
+                continuation: self.pending_input.as_ref().and_then(|p| p.continuation.clone()),
                 recorded_at: now,
             })?;
         }
@@ -2498,7 +2749,9 @@ impl Agent {
         // (any non-compaction replacement) clears it too.
         self.pre_compaction_restated = self.pre_compaction_transcript.as_ref().and(restated);
         self.pending_input = match (self.pending_input.take(), pending_position) {
-            (Some(pending), Some(position)) => Some(PendingInput { position, ..pending }),
+            (Some(pending), Some(position)) => {
+                Some(PendingInput { position, continuation_base: Some(self.conversation.len()), ..pending })
+            }
             _ => None,
         };
         self.calibration = None;
@@ -2779,7 +3032,12 @@ impl Agent {
             && let Some(response) = self.completed_inputs.get(id)
         {
             eprintln!("[agent] input {id:?} already processed; returning recorded response");
-            return Ok(end_turn((response.clone(), self.completed_outcomes.get(id).cloned())));
+            let stop_reason = self.completed_stop_reasons.get(id).copied().unwrap_or(StopReason::EndTurn);
+            return Ok(TurnOutcome {
+                response: response.clone(),
+                stop_reason,
+                outcome: self.completed_outcomes.get(id).cloned(),
+            });
         }
         self.control.start_turn();
         self.reminders.start_turn();
@@ -2793,6 +3051,26 @@ impl Agent {
         // whole log.
         self.turn_log_offset = self.session.as_ref().map(|log| log.size());
         let resuming = self.pending_input.clone().filter(|pending| input_id == Some(pending.id.as_str()));
+        // Where a resumed turn's input sits, so after the replay shortcuts
+        // below we can rebuild any in-flight output-limit continuation state
+        // from the messages logged before the interrupt (issue #114).
+        let resume_position = resuming.as_ref().map(|pending| pending.position);
+        // The continuation state persisted with the pending input (captured
+        // into the `Replace` record at compaction time), extracted before the
+        // `match resuming` below moves it. A mid-turn compaction folds the
+        // truncated chunks into the summary, so this — not the conversation
+        // tail — is where a post-compaction crash recovers them (issue #114).
+        let persisted_continuation = resuming.as_ref().and_then(|pending| pending.continuation.clone());
+        // The compaction boundary persisted with the pending input: the index
+        // past the folded, summarized messages, so recovery replays only the
+        // chunks logged *after* it over `persisted_continuation` (issue #114).
+        // `None` when no compaction intervened — recovery then replays from the
+        // input position with an empty snapshot.
+        let resume_continuation_base = resuming.as_ref().and_then(|pending| pending.continuation_base);
+        // Set to the conversation length just before a resume `SessionStart`
+        // hook's context message is appended, so the continuation scan reads
+        // the persisted turn tail rather than that freshly added context.
+        let mut hook_context_start: Option<usize> = None;
         let input_id = match input_id {
             Some(id) => id.to_string(),
             None => {
@@ -2832,11 +3110,30 @@ impl Agent {
                     self.conversation.len() > pending.position + 1
                         && m.role == Role::Assistant
                         && m.tool_calls.is_empty()
+                        // A length-truncated final assistant message is NOT a
+                        // finished turn: its continuation was cut off by the
+                        // interrupt, so fall through and resume the turn (the
+                        // seeding below rebuilds the partial answer) instead of
+                        // replaying it as a clean `EndTurn` (issue #114).
+                        && !crate::llm::stop_reason_is_length(m.stop_reason.as_deref())
                 }) {
                     // The final answer was recorded but the turn end was not.
-                    let response = last.content.clone();
+                    // Rebuild the *whole* answer, not just the final chunk: a
+                    // crash can land after the clean continuation that follows
+                    // one or more length-truncated chunks, and replaying only
+                    // `last.content` would permanently record the tail and drop
+                    // the earlier prefix (issue #114). Replay the continuation
+                    // chunks logged before this final chunk over any persisted
+                    // snapshot — starting at the compaction boundary when a
+                    // mid-turn compaction folded earlier chunks into the
+                    // summary — then append the final clean chunk.
+                    let end = self.conversation.len() - 1;
+                    let boundary = pending.continuation_base.unwrap_or(pending.position).min(end);
+                    let (prefix, _) =
+                        Self::replay_continuation(pending.continuation.clone(), &self.conversation[boundary..end]);
+                    let response = format!("{prefix}{}", last.content);
                     let outcome = Outcome::reported_in(&self.conversation[pending.position..]);
-                    return self.finish_turn(input_id, response, outcome).map(end_turn);
+                    return self.finish_turn(input_id, response, outcome, StopReason::EndTurn).map(end_turn);
                 } else if self.config.outcome_tool
                     && self.conversation.last().is_some_and(|m| m.role == Role::Tool)
                     && let Some(outcome) = Outcome::reported_in(&self.conversation[pending.position..])
@@ -2844,9 +3141,15 @@ impl Agent {
                     // The outcome was reported but the answer it implies was not recorded.
                     let response = outcome.response();
                     self.push(Message::assistant(&response))?;
-                    return self.finish_turn(input_id, response, Some(outcome)).map(end_turn);
+                    return self.finish_turn(input_id, response, Some(outcome), StopReason::EndTurn).map(end_turn);
                 }
                 if let Some(ctx) = self.take_session_start_context() {
+                    // Remember where the resume `SessionStart` hook context
+                    // lands: it is appended *after* the persisted turn tail, so
+                    // the continuation scan below must look at the messages
+                    // logged *before* this point, not the conversation's new
+                    // tail (issue #114).
+                    hook_context_start = Some(self.conversation.len());
                     self.push(Message::user(&reminders::wrap(&ctx)))?;
                 }
             }
@@ -2857,6 +3160,8 @@ impl Agent {
                             id: input_id.clone(),
                             text: user_input.to_string(),
                             position: self.conversation.len(),
+                            continuation: None,
+                            continuation_base: None,
                         });
                         if let Some(log) = &mut self.session {
                             log.append(&Record::Input {
@@ -2873,7 +3178,7 @@ impl Agent {
                         };
                         self.push(Message::assistant(&reason))?;
                         self.emit_assistant_text(&reason);
-                        return self.finish_turn(input_id, reason, None).map(end_turn);
+                        return self.finish_turn(input_id, reason, None, StopReason::EndTurn).map(end_turn);
                     }
                     ClaudePromptHook::Proceed(extra) => extra,
                 };
@@ -2881,6 +3186,8 @@ impl Agent {
                     id: input_id.clone(),
                     text: user_input.to_string(),
                     position: self.conversation.len(),
+                    continuation: None,
+                    continuation_base: None,
                 });
                 if let Some(log) = &mut self.session {
                     log.append(&Record::Input {
@@ -2914,8 +3221,89 @@ impl Agent {
         let mut last_content = String::new();
         let mut cancelled = false;
         let mut reported: Option<Outcome> = None;
+        // How many times this turn re-prompted a reply cut off at the output
+        // limit, and whether it ultimately gave up on one (so the turn ends
+        // `MaxTokens`, not a clean `EndTurn`).
+        let mut truncated_continuations = 0usize;
+        let mut max_tokens_hit = false;
+        // Contiguous answer text carried across output-limit continuations, so
+        // the final response is the *whole* reply, not just its last chunk. A
+        // reply cut off at the limit is pushed, re-prompted, and continued in a
+        // fresh assistant message; `final_response` (legacy quiet mode, ACP)
+        // would otherwise show only the tail. Accumulated only across length
+        // cut-offs and reset whenever a new answer segment begins — a steer, a
+        // Stop-hook re-prompt, or any tool run (whose dropped tool-call markup
+        // must not leak into the text answer) (issue #114).
+        let mut continued_answer = String::new();
 
-        // The cap is mode-dependent and can be extended when the user says
+        // Rebuild in-flight output-limit continuation state after a resume
+        // (issue #114). A turn cut off mid-continuation has already logged one
+        // or more length-truncated assistant chunks (each followed by an
+        // auto-initiated continuation reminder). Without this, the resumed turn
+        // starts with an empty `continued_answer` and a zero continuation
+        // count, so the earlier chunks are dropped from the final answer and the
+        // re-prompt budget resets. Scan the trailing run of truncated assistant
+        // messages logged before the interrupt, seed the accumulator and count
+        // from them, and — if the turn was cut off before the last chunk's
+        // continuation reminder was logged — re-push that reminder so the model
+        // actually continues.
+        if let Some(start) = resume_position.filter(|&s| s <= self.conversation.len()) {
+            // Read the persisted turn tail, stopping before any resume
+            // `SessionStart` hook context appended above: that fresh message is
+            // not part of the interrupted turn, and scanning into it would stop
+            // the reconstruction at the hook boundary (issue #114).
+            let scan_end = hook_context_start.unwrap_or(self.conversation.len()).max(start);
+            // Replay from the compaction boundary over the persisted snapshot
+            // when a mid-turn compaction folded the earlier chunks into the
+            // summary; otherwise from the input position over an empty snapshot
+            // (a crash with no intervening compaction). A single forward replay
+            // reconstructs both the answer prefix and the turn-wide count, and —
+            // crucially — also walks the messages logged *after* the compaction
+            // (additional chunks, a segment reset), which the snapshot alone
+            // does not capture (issue #114).
+            let boundary = resume_continuation_base.unwrap_or(start).clamp(start, scan_end);
+            let (answer, count) =
+                Self::replay_continuation(persisted_continuation, &self.conversation[boundary..scan_end]);
+            continued_answer = answer;
+            truncated_continuations = count;
+            // Whether the turn's last logged message is a length-truncated
+            // chunk whose continuation reminder was never logged (the crash
+            // landed before it). A property of the real conversation tail,
+            // independent of the compaction boundary: the budget-spending chunk
+            // may itself sit inside the folded, pre-boundary region (issue
+            // #114).
+            let last_is_truncated_assistant = self.conversation[start..scan_end].last().is_some_and(|m| {
+                m.role == Role::Assistant
+                    && m.tool_calls.is_empty()
+                    && crate::llm::stop_reason_is_length(m.stop_reason.as_deref())
+            });
+            // Re-push the continuation reminder only when the interrupt cut the
+            // turn off before logging it AND the budget still has room: a crash
+            // after the budget-spending chunk must not send one more request
+            // that would push the turn past the cap (it ends `MaxTokens`
+            // instead) (issue #114).
+            if last_is_truncated_assistant && truncated_continuations < MAX_TRUNCATED_CONTINUATIONS {
+                self.push(Message::user(&reminders::wrap(&truncated_continuation_note(0))).continuation())?;
+            }
+            // Mirror the restored state back into the pending input so a later
+            // mid-turn compaction captures it (issue #114).
+            self.sync_pending_continuation(&continued_answer, truncated_continuations);
+
+            // A crash after the budget-spending chunk (count already at the
+            // cap) but before `TurnEnd` leaves a turn that must NOT call the
+            // model again: the reminder guard above suppresses the re-prompt,
+            // but the request loop would still run and a clean reply would be
+            // recorded `EndTurn`, hiding that the answer was cut off. Finish
+            // the recovered turn here as `MaxTokens`, preserving the
+            // accumulated answer (issue #114).
+            if last_is_truncated_assistant && truncated_continuations >= MAX_TRUNCATED_CONTINUATIONS {
+                let response = continued_answer.clone();
+                let outcome = Outcome::reported_in(&self.conversation[start..]);
+                let (response, outcome) = self.finish_turn(input_id, response, outcome, StopReason::MaxTokens)?;
+                return Ok(TurnOutcome { response, stop_reason: StopReason::MaxTokens, outcome });
+            }
+        }
+
         // "keep going". Auto mode disables it (interactive only); normal mode
         // asks (interactive only); ACP/headless keeps the hard stop.
         // Re-evaluated from the live mode each iteration so a mid-turn
@@ -2967,7 +3355,16 @@ impl Agent {
                 cancelled = true;
                 break;
             }
-            self.absorb_steers()?;
+            if self.absorb_steers()? {
+                // A steer absorbed here begins a new answer segment, like a
+                // tool run or a Stop-hook re-prompt: drop any accumulated
+                // output-limit continuation prefix so the revised answer is not
+                // prefixed by the discarded cut-off chunk. The turn-wide
+                // continuation budget is retained — the steer does not refund a
+                // spent cut-off (issue #114).
+                continued_answer.clear();
+                self.sync_pending_continuation(&continued_answer, truncated_continuations);
+            }
             // A `/model <spec>` typed mid-turn applies here, so the request
             // built below goes to the new model. If the turn was cancelled
             // while the switch was building, stop before the threshold
@@ -3011,6 +3408,10 @@ impl Agent {
             }
 
             let mut overflow_retried = false;
+            // Whether this attempt already retried after learning the model's
+            // real output-token cap from a rejection (issue #114); bounds the
+            // retry to one so a persistent rejection still surfaces.
+            let mut max_output_retried = false;
             // Reset per attempt, so the recorded duration is the request that
             // produced the response, not earlier overflowed attempts. Seeded so
             // an early cancel break (before the first attempt sets it) leaves it
@@ -3206,6 +3607,50 @@ impl Agent {
                     }
                     Some(Err(e)) => {
                         let message = format!("{e:#}");
+                        // An output-token-limit rejection: the configured or
+                        // fallback `max_tokens` exceeds the model's real output
+                        // cap. This is common right after a `/model` switch —
+                        // the background capability probe that would publish the
+                        // real cap has not landed yet, so automatic `max_tokens`
+                        // falls back to the large default and the request is
+                        // rejected. Learn the cap from the error and retry once
+                        // at the lower value rather than failing the turn, so the
+                        // switch never has to block on the probe (issue #114).
+                        if !max_output_retried
+                            && context::is_output_cap_error(&message)
+                            && !context::is_context_overflow(&message)
+                        {
+                            max_output_retried = true;
+                            // Derive the no-numeric-limit fallback from the
+                            // budget this request actually *sent*
+                            // (`request_max_tokens`, after the context-window
+                            // clamp), not the unclamped base: a context-clamped
+                            // request sends far less than the base, so halving
+                            // the base can land *above* what was sent, making
+                            // `learned < request_max_tokens` false and failing
+                            // the turn without ever retrying (issue #114).
+                            let learned = context::output_cap_from_error(&message)
+                                .map(|c| c as i64)
+                                .unwrap_or((request_max_tokens / 2).max(1_024))
+                                .max(256);
+                            // Only act when this actually lowers the request.
+                            // Compare against the budget this request *sent*
+                            // (`request_max_tokens`), not the current base: a
+                            // background probe that publishes the real cap
+                            // between the send and the rejection already lowers
+                            // the base, so measuring against it would wrongly
+                            // conclude the learned cap is no improvement and
+                            // fail a turn that a retry at the sent budget's
+                            // lower value would save (issue #114).
+                            if learned < request_max_tokens {
+                                self.learned_max_output = Some(learned as usize);
+                                self.refresh_stats();
+                                eprintln!(
+                                    "[agent] output-limit rejection ({message}); retrying with max_tokens={learned}"
+                                );
+                                continue;
+                            }
+                        }
                         if overflow_retried || !context::is_context_overflow(&message) {
                             self.set_activity(Activity::Idle);
                             return Err(e);
@@ -3263,6 +3708,9 @@ impl Agent {
                 thinking_level: (sent_thinking.effective != crate::thinking::Thinking::Default
                     || sent_thinking.source != crate::thinking::Source::Global)
                     .then(|| sent_thinking.describe()),
+                // Recorded so a turn cut off at the output-token limit is
+                // diagnosable from the session log (issue #114).
+                stop_reason: response.stop_reason.clone(),
                 ..message
             };
 
@@ -3286,6 +3734,10 @@ impl Agent {
                 // A steer that arrived while the answer was being written gets
                 // a reply in this turn rather than being left for the next.
                 if iteration < budget && self.control.has_steers() && !self.control.is_cancelled() {
+                    // A steer starts a new answer; drop any accumulated cut-off
+                    // chunks so the steer's reply is not prefixed by the old one.
+                    continued_answer.clear();
+                    self.sync_pending_continuation(&continued_answer, truncated_continuations);
                     last_content = response.content.clone();
                     continue;
                 }
@@ -3295,14 +3747,61 @@ impl Agent {
                     && !self.control.is_cancelled()
                     && let Some(reason) = self.run_claude_stop_hooks()
                 {
-                    self.push(Message::user(&reminders::wrap(&reason)))?;
+                    self.push(Message::user(&reminders::wrap(&reason)).auto_initiated())?;
+                    // The Stop-hook reply is a fresh answer, not a continuation.
+                    continued_answer.clear();
+                    self.sync_pending_continuation(&continued_answer, truncated_continuations);
                     last_content = response.content.clone();
                     continue;
                 }
-                final_response = Some(response.content.clone());
+                // A reply cut off at the output-token limit is not a finished
+                // answer: the model stopped because it ran out of room, and any
+                // tool call it was emitting was dropped before it could be
+                // parsed (issue #114). Nudge it to continue in smaller pieces
+                // rather than ending the turn as if it were done. Capped so a
+                // model that keeps overrunning cannot loop forever; past the cap
+                // the turn ends with a distinct `MaxTokens` stop reason so
+                // callers can tell this apart from a clean finish.
+                if crate::llm::stop_reason_is_length(response.stop_reason.as_deref()) {
+                    if iteration < budget
+                        && !self.control.is_cancelled()
+                        && truncated_continuations < MAX_TRUNCATED_CONTINUATIONS
+                    {
+                        truncated_continuations += 1;
+                        let tokens = response.usage.as_ref().map_or(0, |u| u.completion_tokens);
+                        self.push(
+                            Message::user(&reminders::wrap(&truncated_continuation_note(tokens))).continuation(),
+                        )?;
+                        // Keep this cut-off chunk so the finished answer is the
+                        // whole reply, not just the final continuation's tail.
+                        continued_answer.push_str(&response.content);
+                        self.sync_pending_continuation(&continued_answer, truncated_continuations);
+                        last_content = response.content.clone();
+                        #[cfg(test)]
+                        if let Some(hook) = self.after_continuation_scheduled.take() {
+                            hook();
+                        }
+                        continue;
+                    }
+                    // The continuation cap is spent, or the turn cannot continue
+                    // (cancelled / iteration budget). End, but flag it so the
+                    // turn reports `MaxTokens` rather than a clean `EndTurn`.
+                    max_tokens_hit = true;
+                }
+                // Prepend any chunks carried across output-limit continuations so
+                // the final response is the contiguous answer, not its tail.
+                final_response = Some(if continued_answer.is_empty() {
+                    response.content.clone()
+                } else {
+                    format!("{continued_answer}{}", response.content)
+                });
                 break;
             }
 
+            // Tool calls begin a new answer segment: the dropped tool-call markup
+            // must not bleed into a later text answer, so reset the accumulator.
+            continued_answer.clear();
+            self.sync_pending_continuation(&continued_answer, truncated_continuations);
             last_content = response.content.clone();
             self.push(trajectory(Message::assistant_with_tools(&response.content, response.tool_calls.clone())))?;
             self.emit_assistant_text(&response.content);
@@ -3675,7 +4174,7 @@ impl Agent {
                     && !self.control.is_cancelled()
                     && let Some(reason) = self.run_claude_stop_hooks()
                 {
-                    self.push(Message::user(&reminders::wrap(&reason)))?;
+                    self.push(Message::user(&reminders::wrap(&reason)).auto_initiated())?;
                     last_content = reported.take().map(|outcome| outcome.response()).unwrap_or_default();
                     continue;
                 }
@@ -3692,13 +4191,15 @@ impl Agent {
 
         let stop_reason = if cancelled || (final_response.is_none() && self.control.is_cancelled()) {
             StopReason::Cancelled
+        } else if max_tokens_hit {
+            StopReason::MaxTokens
         } else if final_response.is_some() {
             StopReason::EndTurn
         } else {
             StopReason::MaxTurnRequests
         };
         let response = match stop_reason {
-            StopReason::EndTurn => final_response.unwrap_or_default(),
+            StopReason::EndTurn | StopReason::MaxTokens => final_response.unwrap_or_default(),
             StopReason::Cancelled => CANCELLED_RESPONSE.to_string(),
             StopReason::MaxTurnRequests => {
                 // `iteration` was incremented past the cap before the loop
@@ -3710,7 +4211,7 @@ impl Agent {
             }
         };
         let outcome = reported.filter(|_| stop_reason == StopReason::EndTurn);
-        let (response, outcome) = self.finish_turn(input_id, response, outcome)?;
+        let (response, outcome) = self.finish_turn(input_id, response, outcome, stop_reason)?;
         Ok(TurnOutcome { response, stop_reason, outcome })
     }
 
@@ -3719,12 +4220,14 @@ impl Agent {
         input_id: String,
         response: String,
         outcome: Option<Outcome>,
+        stop_reason: StopReason,
     ) -> Result<(String, Option<Outcome>)> {
         if let Some(log) = &mut self.session {
             log.append(&Record::TurnEnd {
                 input_id: input_id.clone(),
                 response: response.clone(),
                 outcome: outcome.clone(),
+                stop_reason,
                 history_calls: self.turn_history_calls,
                 recorded_at: session::now(),
             })?;
@@ -3745,6 +4248,11 @@ impl Agent {
             Some(outcome) => self.completed_outcomes.insert(input_id.clone(), outcome.clone()),
             None => self.completed_outcomes.remove(&input_id),
         };
+        if stop_reason.is_end_turn() {
+            self.completed_stop_reasons.remove(&input_id);
+        } else {
+            self.completed_stop_reasons.insert(input_id.clone(), stop_reason);
+        }
         self.completed_inputs.insert(input_id, response.clone());
         self.pending_input = None;
         Ok((response, outcome))
@@ -3785,7 +4293,7 @@ impl Agent {
         // rejected.
         let reserved = match self.context_cap() {
             ContextCap::Total => {
-                (self.config.max_tokens.max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(window)
+                (self.output_token_base().max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(window)
             }
             ContextCap::Prompt => output_margin(window),
         };
@@ -3800,7 +4308,7 @@ impl Agent {
         let limit = match self.combined_window() {
             Some(combined) if self.context_cap() == ContextCap::Prompt => {
                 let combined_reserved =
-                    (self.config.max_tokens.max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(combined);
+                    (self.output_token_base().max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(combined);
                 limit.min(combined.saturating_sub(combined_reserved) as f64)
             }
             _ => limit,
@@ -3822,7 +4330,7 @@ impl Agent {
     /// combined window still bounds prompt + output, so `max_tokens` is capped to
     /// the room left in *that* window rather than sent unchanged.
     fn request_max_tokens(&self) -> i64 {
-        let configured = self.config.max_tokens.max(1) as usize;
+        let configured = self.output_token_base().max(1) as usize;
         let (tokens, _) = self.estimate_context_tokens();
         if self.context_cap() == ContextCap::Prompt {
             // The prompt cap does not consume output tokens; only the combined
@@ -3928,7 +4436,11 @@ impl Agent {
             split = last_boundary;
         }
         let (tokens_before, _) = self.estimate_context_tokens();
-        let summarized = &self.conversation[body_start..split];
+        // Owned, not a borrow of `self.conversation`: the summary retry loop
+        // calls `apply_model_request()` (`&mut self`) to honour a `/model`
+        // switch queued mid-compaction, which a borrow of the conversation
+        // would block (issue #114).
+        let summarized: Vec<Message> = self.conversation[body_start..split].to_vec();
         if summarized.is_empty() {
             return Ok(None);
         }
@@ -3956,59 +4468,45 @@ impl Agent {
             None => summarized.to_vec(),
         };
 
-        let output_budget = context::summary_output_budget(window, self.config.max_tokens as i64);
+        // The summary's output budget and the transcript's share of the window
+        // are recomputed per attempt (the closure below): an output-cap
+        // rejection learns the real cap and retries at the lower budget, and the
+        // budget must move with it (issue #114).
         // The transcript and the summary's own output share the request budget.
         // Against a total/combined cap the prompt and output must fit together,
         // so the output budget is carved out of the window. A prompt-only cap
         // (GitHub Copilot's `max_prompt_tokens`) does not spend output tokens,
         // so the transcript gets the whole prompt window; only a combined window
         // the endpoint advertised still bounds prompt + output. This mirrors
-        // `request_max_tokens()`'s cap handling.
-        let input_window = match self.context_cap() {
-            ContextCap::Prompt => match self.combined_window() {
-                Some(combined) => window.min(combined.saturating_sub(output_budget as usize)),
-                None => window,
-            },
-            ContextCap::Total => window.saturating_sub(output_budget as usize),
-        };
-        let summary_input_chars = input_window.saturating_sub(2_000).max(2_000) * 3;
-        let transcript = context::render_transcript(summarized, summary_input_chars, smart);
+        // `request_max_tokens()`'s cap handling. The model-dependent inputs
+        // (`window`, `context_cap`, `combined_window`) are passed in per attempt
+        // — not captured — so a `/model` switch honoured on a retry rebuilds
+        // them for the new model (issue #114).
+        let build_request =
+            |output_budget: i64, window: usize, context_cap: ContextCap, combined_window: Option<usize>| {
+                let input_window = match context_cap {
+                    ContextCap::Prompt => match combined_window {
+                        Some(combined) => window.min(combined.saturating_sub(output_budget as usize)),
+                        None => window,
+                    },
+                    ContextCap::Total => window.saturating_sub(output_budget as usize),
+                };
+                let summary_input_chars = input_window.saturating_sub(2_000).max(2_000) * 3;
+                let transcript = context::render_transcript(&summarized, summary_input_chars, smart);
+                let mut request_text = format!("Conversation to summarize:\n\n{transcript}");
+                if let Some(focus) = instructions.map(str::trim).filter(|f| !f.is_empty()) {
+                    request_text.push_str(&format!("\n\nWhen summarizing, focus on: {focus}"));
+                }
+                let system_prompt = if smart {
+                    format!("{}{}", context::SUMMARY_SYSTEM_PROMPT, context::SMART_SUMMARY_INSTRUCTIONS)
+                } else {
+                    context::SUMMARY_SYSTEM_PROMPT.to_string()
+                };
+                let summary_messages = [Message::system(&system_prompt), Message::user(&request_text)];
+                (summary_messages, output_budget)
+            };
         let lines: Vec<u64> = summarized.iter().filter_map(|m| m.log_line).collect();
         let range = lines.iter().min().zip(lines.iter().max()).map(|(a, b)| (*a, *b));
-        let mut request_text = format!("Conversation to summarize:\n\n{transcript}");
-        if let Some(focus) = instructions.map(str::trim).filter(|f| !f.is_empty()) {
-            request_text.push_str(&format!("\n\nWhen summarizing, focus on: {focus}"));
-        }
-        let system_prompt = if smart {
-            format!("{}{}", context::SUMMARY_SYSTEM_PROMPT, context::SMART_SUMMARY_INSTRUCTIONS)
-        } else {
-            context::SUMMARY_SYSTEM_PROMPT.to_string()
-        };
-        let summary_messages = [Message::system(&system_prompt), Message::user(&request_text)];
-        let request = ChatRequest {
-            messages: &summary_messages,
-            tools: &[],
-            // Compaction goes through the same resolution as a chat turn, so a
-            // legacy `extra_body` temperature override still applies (the
-            // transport no longer re-inserts it) and fixed-temperature models
-            // still send none. This request sends no thinking field
-            // (`thinking: None`), which turns thinking off only for a model
-            // that supports an `off` level — so resolve temperature as
-            // thinking-off there, and a configured temperature is not dropped
-            // as if the configured level were sent. A model whose levels omit
-            // `off` (Fable, Claude 5.5+) always thinks, so it still gets no
-            // custom temperature.
-            temperature: self.temperature_for(self.thinking().always_anthropic_thinking()).value(),
-            max_tokens: Some(output_budget),
-            // A summary needs no extended reasoning; the model's own default
-            // applies, as before thinking levels existed.
-            thinking: None,
-            // The summary request never includes images: the transcript renders
-            // them as text placeholders, and the freshly built summary messages
-            // carry no attachments.
-            vision: None,
-            attachments_dir: None,
-        };
         let control = self.control.clone();
         // Stream the summary even though its text is used only once complete.
         // A summary prompt is new text that no prefix cache holds. A local
@@ -4018,14 +4516,103 @@ impl Agent {
         // A stream carries the server's keepalives (and falls back to one
         // whole response for providers configured with `stream = false`).
         let discard = |_: StreamEvent<'_>| {};
-        let result = tokio::select! {
-            // Prefer cancellation: a cancel already pending when the summary
-            // request is issued must win over an immediately-ready model
-            // future, so a cancelled compaction never lands a call on the
-            // model the user just switched away from.
-            biased;
-            () = control.cancelled() => return Ok(None),
-            result = self.client.chat_stream(&request, &discard) => result,
+        // Like a chat turn, the summary request can be rejected for exceeding
+        // the model's real output cap (common right after a reload or `/model`
+        // switch, before the capability probe lands). Learn the cap and retry
+        // once at the lower budget instead of falling through to the
+        // dropped-history fallback, which would lose the summarized context
+        // (issue #114).
+        let mut summary_output_retried = false;
+        let result = loop {
+            // Honour a `/model` switch queued while a previous summary attempt
+            // was in flight, before building this attempt's request — the chat
+            // retry loop does the same, and compaction's single call checked
+            // before this loop existed. A switch rebuilds the model-dependent
+            // window, temperature and output budget below so the retry goes to
+            // the new model, not the one the user switched away from. If the
+            // turn was cancelled while the switch was building, stop before the
+            // summary call (issue #114).
+            if self.apply_model_request().await {
+                return Ok(None);
+            }
+            // Recomputed per attempt: a model switch above changes the window,
+            // the cap source, the combined window and the temperature, and an
+            // output-cap retry below changes the budget via `learned_max_output`.
+            let window = self.context_window();
+            let context_cap = self.context_cap();
+            let combined_window = self.combined_window();
+            // Resolved per attempt: it borrows `self`, which the retry's
+            // `learned_max_output` assignment and the model switch above need
+            // mutably, and a switch changes the value.
+            let summary_temperature = self.temperature_for(self.thinking().always_anthropic_thinking()).value();
+            let output_budget = context::summary_output_budget(window, self.output_token_base());
+            let (summary_messages, budget) = build_request(output_budget, window, context_cap, combined_window);
+            let request = ChatRequest {
+                messages: &summary_messages,
+                tools: &[],
+                // Compaction goes through the same resolution as a chat turn, so a
+                // legacy `extra_body` temperature override still applies (the
+                // transport no longer re-inserts it) and fixed-temperature models
+                // still send none. This request sends no thinking field
+                // (`thinking: None`), which turns thinking off only for a model
+                // that supports an `off` level — so resolve temperature as
+                // thinking-off there, and a configured temperature is not dropped
+                // as if the configured level were sent. A model whose levels omit
+                // `off` (Fable, Claude 5.5+) always thinks, so it still gets no
+                // custom temperature.
+                temperature: summary_temperature,
+                max_tokens: Some(budget),
+                // A summary needs no extended reasoning; the model's own default
+                // applies, as before thinking levels existed.
+                thinking: None,
+                // The summary request never includes images: the transcript renders
+                // them as text placeholders, and the freshly built summary messages
+                // carry no attachments.
+                vision: None,
+                attachments_dir: None,
+            };
+            let attempt = tokio::select! {
+                // Prefer cancellation: a cancel already pending when the summary
+                // request is issued must win over an immediately-ready model
+                // future, so a cancelled compaction never lands a call on the
+                // model the user just switched away from.
+                biased;
+                () = control.cancelled() => return Ok(None),
+                result = self.client.chat_stream(&request, &discard) => result,
+            };
+            match attempt {
+                Err(e) if !summary_output_retried => {
+                    let message = format!("{e:#}");
+                    if context::is_output_cap_error(&message) && !context::is_context_overflow(&message) {
+                        summary_output_retried = true;
+                        // A numeric limit parsed from the error is the real cap.
+                        // Without one, fall back to halving the budget this
+                        // summary request actually *sent* — not the chat base,
+                        // which can be larger than the summary budget (a 32,768
+                        // base yields a 12,288 summary budget; halving the base
+                        // infers a 16,384 cap that is NOT below the sent budget,
+                        // so the `learned < budget` check would skip the retry
+                        // and drop history) (issue #114).
+                        let learned = context::output_cap_from_error(&message)
+                            .map(|c| c as i64)
+                            .unwrap_or((budget / 2).max(1_024))
+                            .max(256);
+                        // Retry only when the learned cap actually lowers the
+                        // summary budget we just sent; otherwise the rejection
+                        // is about something else and retrying would repeat it.
+                        if learned < budget {
+                            self.learned_max_output = Some(learned as usize);
+                            self.refresh_stats();
+                            eprintln!(
+                                "[agent] summary output-limit rejection ({message}); retrying with max_tokens={learned}"
+                            );
+                            continue;
+                        }
+                    }
+                    break Err(e);
+                }
+                other => break other,
+            }
         };
         let mut truncated = false;
         let (summary, fallback) = match result {
@@ -4785,8 +5372,843 @@ mod tests {
         );
     }
 
-    /// `n` scripted responses whose `echo` calls all differ, so the loop
-    /// detector stays out of the way of the turn-cap tests.
+    /// A text response cut off at the output-token limit (`stop_reason:
+    /// length`), carrying `completion_tokens` in its usage.
+    fn cut_text(content: &str, completion_tokens: i64) -> LLMResponse {
+        LLMResponse {
+            content: content.into(),
+            stop_reason: Some("length".into()),
+            usage: Some(crate::llm::TokenUsage {
+                prompt_tokens: 0,
+                completion_tokens,
+                total_tokens: completion_tokens,
+                aic: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reply_cut_off_at_the_output_limit_continues_instead_of_ending() {
+        let dir = tempfile::tempdir().unwrap();
+        // First reply is cut off at the output limit with no tool call; the turn
+        // must not end there — it nudges the model to continue, then ends clean
+        // on the finished second reply.
+        let (mut agent, seen) = agent(vec![cut_text("half a file", 4096), text("all done")], dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        // The second reply *completes* the first rather than replacing it, so
+        // the final response is the whole answer, not just its tail (issue #114).
+        assert_eq!(outcome.response, "half a fileall done");
+        // The model got a "cut off" continuation note as a user message before
+        // the second call, mentioning the token count.
+        let second = &seen.lock().unwrap()[1];
+        let note = second.iter().rev().find(|m| m.role == Role::User).unwrap();
+        assert!(note.content.contains("cut off"), "{}", note.content);
+        assert!(note.content.contains("4096"), "{}", note.content);
+        // The truncated assistant message records its stop reason in the log.
+        let cut = agent.conversation().iter().find(|m| m.content == "half a file").unwrap();
+        assert_eq!(cut.stop_reason.as_deref(), Some("length"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_output_limit_cut_offs_end_with_a_distinct_stop_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        // Every reply is cut off at the output limit. The turn re-prompts up to
+        // the cap, then gives up with `MaxTokens` rather than a clean `EndTurn`.
+        let cuts: Vec<LLMResponse> =
+            (0..MAX_TRUNCATED_CONTINUATIONS + 1).map(|_| cut_text("still going", 100)).collect();
+        let (mut agent, seen) = agent(cuts, dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::MaxTokens);
+        assert_eq!(outcome.stop_reason.as_acp(), "max_tokens");
+        // The cap bounds the number of continuations: one initial call plus
+        // `MAX_TRUNCATED_CONTINUATIONS` re-prompts.
+        assert_eq!(seen.lock().unwrap().len(), MAX_TRUNCATED_CONTINUATIONS + 1);
+        // Even giving up, the final response stitches the accumulated chunks
+        // rather than returning only the last cut-off tail (issue #114).
+        assert_eq!(outcome.response, "still going".repeat(MAX_TRUNCATED_CONTINUATIONS + 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn output_limit_continuations_accumulate_the_whole_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two cut-offs then a clean finish: the final response stitches all
+        // three contiguous chunks, not just the last one (issue #114).
+        let (mut agent, _seen) = agent(vec![cut_text("one ", 100), cut_text("two ", 100), text("three")], dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "one two three");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_same_agent_retry_after_a_provider_error_does_not_replay_the_snapshot_twice() {
+        // A transient provider error leaves the turn pending with its in-flight
+        // continuation snapshot synced into the live pending input. Retrying the
+        // same input id on the *same* Agent must replay only the messages logged
+        // *after* that snapshot — never the chunk/reminder already folded into
+        // it — or the answer prefix duplicates and the continuation budget is
+        // double-spent, cutting the turn off at `MaxTokens` a chunk early (issue
+        // #114).
+        struct ErrorThenScript {
+            calls: Mutex<usize>,
+            seen: Seen,
+        }
+        #[async_trait]
+        impl LLMClient for ErrorThenScript {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                unimplemented!("test double is never cloned")
+            }
+            async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+                self.seen.lock().unwrap().push(request.messages.to_vec());
+                let n = {
+                    let mut calls = self.calls.lock().unwrap();
+                    let n = *calls;
+                    *calls += 1;
+                    n
+                };
+                match n {
+                    // First attempt: one chunk cut off at the output limit
+                    // (schedules a single continuation).
+                    0 => Ok(cut_text("one ", 50)),
+                    // A transient provider error — not an output-cap or overflow
+                    // rejection — so the turn fails and is left pending.
+                    1 => anyhow::bail!("provider glitch"),
+                    // The same-Agent retry: two more cut-off chunks, then a clean
+                    // finish. With the budget counted once (count 1 restored),
+                    // both fit before the cap; counted twice (count 2) the second
+                    // would overrun it.
+                    2 => Ok(cut_text("two ", 50)),
+                    3 => Ok(cut_text("three ", 50)),
+                    _ => Ok(text("four")),
+                }
+            }
+            fn model_name(&self) -> &str {
+                "scripted"
+            }
+            fn provider_name(&self) -> &str {
+                "test"
+            }
+            fn kind(&self) -> Option<providers::ProviderKind> {
+                Some(providers::ProviderKind::Openai)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(ErrorThenScript { calls: Mutex::new(0), seen: seen.clone() }), config);
+        agent.new_session().unwrap();
+
+        // First attempt schedules one continuation, then the provider errors and
+        // the turn is left pending on this live Agent.
+        let first = agent.run_turn(Some("in-1"), "go").await;
+        assert!(first.is_err(), "the provider error fails the first attempt: {first:?}");
+
+        // Same-Agent retry of the same input id. With the snapshot's replay
+        // boundary advanced in lockstep, recovery restores exactly one spent
+        // continuation (count 1, prefix "one "), so the retry has room for two
+        // more cut-off chunks ("two ", "three ") before the clean finish.
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            StopReason::EndTurn,
+            "the budget is spent once, so the turn is not cut short at MaxTokens"
+        );
+        assert_eq!(
+            outcome.response, "one two three four",
+            "the recovered prefix is counted once, not doubled into a premature stop"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_run_resets_the_continuation_accumulator() {
+        let dir = tempfile::tempdir().unwrap();
+        // A cut-off text chunk is accumulated, but then the model runs a tool —
+        // a new answer segment begins, so the earlier chunk (and any dropped
+        // tool-call markup) must not prefix the final answer (issue #114).
+        let (mut agent, _seen) =
+            agent(vec![cut_text("stale partial", 100), tool_call("c1"), text("fresh answer")], dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "fresh answer");
+    }
+
+    /// An assistant message cut off at the output-token limit, as recorded in a
+    /// session log (its `stop_reason` is `length`).
+    fn truncated_assistant(content: &str) -> Message {
+        Message { stop_reason: Some("length".into()), ..Message::assistant(content) }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redelivering_a_truncated_turn_replays_its_stop_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        // A turn that gives up at the continuation cap ends `MaxTokens`.
+        let cuts: Vec<LLMResponse> = (0..MAX_TRUNCATED_CONTINUATIONS + 1).map(|_| cut_text("more", 50)).collect();
+        let (mut agent, seen) = agent(cuts, dir.path());
+        agent.new_session().unwrap();
+        let first = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(first.stop_reason, StopReason::MaxTokens);
+        seen.lock().unwrap().clear();
+        // Redelivering the same input ID returns the recorded truncated stop
+        // reason without calling the model, rather than a clean `EndTurn`
+        // (issue #114).
+        let replay = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(replay.stop_reason, StopReason::MaxTokens);
+        assert_eq!(replay.response, first.response);
+        assert!(seen.lock().unwrap().is_empty(), "a recorded turn is not re-run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_truncated_turns_stop_reason_survives_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let cuts: Vec<LLMResponse> = (0..MAX_TRUNCATED_CONTINUATIONS + 1).map(|_| cut_text("more", 50)).collect();
+        let (mut first, _) = agent(cuts, dir.path());
+        let id = first.new_session().unwrap();
+        assert_eq!(first.run_turn(Some("in-1"), "go").await.unwrap().stop_reason, StopReason::MaxTokens);
+        // The persisted `TurnEnd` carries the truncated stop reason.
+        drop(first);
+        let (_, restored) = SessionLog::open(dir.path(), &id).unwrap();
+        assert_eq!(restored.stop_reasons.get("in-1"), Some(&StopReason::MaxTokens));
+
+        // After a reload, redelivering the input still reports `MaxTokens` from
+        // the log, not a clean `EndTurn`, without calling the model (issue #114).
+        let (mut second, seen) = agent(vec![], dir.path());
+        second.load_session(&id).unwrap();
+        let replay = second.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(replay.stop_reason, StopReason::MaxTokens);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_a_logged_continuation_reminder_stitches_the_prefix() {
+        // Interrupt case (a): the turn was cut off at the output limit AND its
+        // continuation reminder was logged before the crash. The resume must
+        // continue the turn and prepend the saved prefix, not start empty
+        // (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        crashed_session(
+            dir.path(),
+            "cut-a",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("partial "))),
+                Record::Message(Box::new(
+                    Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation(),
+                )),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![text("done")], dir.path());
+        agent.load_session("cut-a").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "partial done");
+        // The model was called once to continue — the already-logged reminder is
+        // not duplicated.
+        let request = &seen.lock().unwrap()[0];
+        let reminders = request.iter().filter(|m| m.auto_initiated).count();
+        assert_eq!(reminders, 1, "the existing reminder is reused, not re-pushed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_before_a_logged_continuation_reminder_re_prompts_and_stitches() {
+        // Interrupt case (b): the turn was cut off at the output limit but the
+        // crash landed before its continuation reminder was logged. The resume
+        // must re-push the reminder so the model continues, and still prepend the
+        // saved prefix (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        crashed_session(
+            dir.path(),
+            "cut-b",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("partial "))),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![text("done")], dir.path());
+        agent.load_session("cut-b").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "partial done");
+        // A continuation reminder was synthesized so the model actually continues.
+        let request = &seen.lock().unwrap()[0];
+        let note = request.iter().rev().find(|m| m.auto_initiated).expect("a continuation reminder");
+        assert!(note.content.contains("cut off"), "{}", note.content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_truncated_final_assistant_is_not_replayed_as_a_clean_finish() {
+        // A length-truncated trailing assistant message must NOT be treated as a
+        // finished turn by the resume replay shortcut: the turn resumes and
+        // continues instead of completing with a clean `EndTurn` (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        crashed_session(
+            dir.path(),
+            "cut-final",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("partial "))),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![text("done")], dir.path());
+        agent.load_session("cut-final").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        // The model was called (the turn continued) rather than short-circuited.
+        assert!(!seen.lock().unwrap().is_empty(), "the truncated turn resumed with a model call");
+        assert_eq!(outcome.response, "partial done");
+    }
+
+    /// A client that rejects any request whose `max_tokens` exceeds `cap`
+    /// (mirroring a provider's output-limit rejection), then serves `response`.
+    struct OutputCapClient {
+        cap: i64,
+        seen_max_tokens: Arc<Mutex<Vec<i64>>>,
+        response: Mutex<Option<LLMResponse>>,
+        /// Side effect run on the first rejection (e.g. publish a probed cap).
+        on_reject: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for OutputCapClient {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            let max_tokens = request.max_tokens.unwrap_or(0);
+            self.seen_max_tokens.lock().unwrap().push(max_tokens);
+            if max_tokens > self.cap {
+                if let Some(hook) = self.on_reject.lock().unwrap().take() {
+                    hook();
+                }
+                anyhow::bail!(
+                    "max_tokens: {max_tokens} > {}, which is the maximum allowed number of output tokens",
+                    self.cap
+                );
+            }
+            Ok(self.response.lock().unwrap().clone().unwrap_or_default())
+        }
+        fn model_name(&self) -> &str {
+            "scripted"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+        fn kind(&self) -> Option<providers::ProviderKind> {
+            Some(providers::ProviderKind::Openai)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_output_limit_rejection_is_learned_and_retried() {
+        // Automatic `max_tokens` sends the large default to a model whose real
+        // output cap `/models` never published (e.g. a freshly switched model
+        // whose background probe has not landed). The rejection must be learned
+        // and the request retried at the real cap, not fail the turn (issue
+        // #114).
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = OutputCapClient {
+            cap: 8_000,
+            seen_max_tokens: seen.clone(),
+            response: Mutex::new(Some(text("recovered"))),
+            on_reject: Mutex::new(None),
+        };
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "recovered");
+        let sent = seen.lock().unwrap().clone();
+        // First attempt sent the over-cap default and was rejected; the retry
+        // sent a value within the learned cap.
+        assert_eq!(sent.len(), 2, "one rejected attempt, then one retry: {sent:?}");
+        assert!(sent[0] > 8_000, "first attempt sent the over-cap default: {}", sent[0]);
+        assert!(sent[1] <= 8_000, "retry sent within the learned cap: {}", sent[1]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_output_limit_rejection_is_retried_against_the_sent_budget() {
+        // The learned cap must be compared to the budget the request actually
+        // *sent*, not the current (already-lowered) base. Simulate a background
+        // probe that publishes the real cap *after* the request is built but
+        // *before* its rejection is handled — the send uses the over-cap
+        // fallback, then the base drops to the published cap. The retry must
+        // still happen (the sent budget exceeded the cap) rather than
+        // concluding `learned < base` is false and failing the turn (issue
+        // #114).
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            ..Config::default()
+        };
+        // Build the agent around a placeholder client, grab its
+        // `reported_max_output` slot, then swap in the cap client whose
+        // rejection publishes the probed cap into that slot — the interleaving
+        // where the base drops between the send and the rejection handling.
+        let mut agent = Agent::new(
+            Box::new(Scripted { responses: Mutex::new(vec![]), seen: Arc::new(Mutex::new(vec![])) }),
+            config,
+        );
+        let reported = agent.reported_max_output.clone();
+        let client = OutputCapClient {
+            cap: 8_000,
+            seen_max_tokens: seen.clone(),
+            response: Mutex::new(Some(text("recovered"))),
+            on_reject: Mutex::new(Some(Box::new(move || {
+                *reported.lock().unwrap() = Some(8_000);
+            }))),
+        };
+        agent.client = Box::new(client);
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "recovered");
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "one rejected attempt, then one retry: {sent:?}");
+        assert!(sent[0] > 8_000, "first attempt sent the over-cap fallback: {}", sent[0]);
+        assert!(sent[1] <= 8_000, "retry sent within the learned cap: {}", sent[1]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_after_a_crash_rebuilds_the_whole_answer() {
+        // Interrupt: the turn was cut off at the output limit (logging a
+        // truncated chunk + reminder), then produced its clean final chunk, and
+        // the crash landed before `TurnEnd`. The replay shortcut must rebuild
+        // the *contiguous* answer — truncated prefix plus the final chunk — not
+        // record only the final chunk (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        crashed_session(
+            dir.path(),
+            "replay-prefix",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("partial "))),
+                Record::Message(Box::new(
+                    Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation(),
+                )),
+                Record::Message(Box::new(Message::assistant("done"))),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![], dir.path());
+        agent.load_session("replay-prefix").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "partial done", "the replay rebuilds the whole answer, not just the tail");
+        assert!(seen.lock().unwrap().is_empty(), "a recorded answer is replayed, not re-run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_restores_the_continuation_budget_before_a_tool_run() {
+        // The continuation budget is turn-wide, not just the trailing answer
+        // run: two continuations, a tool run (which clears the answer
+        // accumulator), and a third continuation must restore a count of 3, so
+        // the resumed turn knows the budget is already spent (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let reminder = || Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation();
+        crashed_session(
+            dir.path(),
+            "budget",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("a"))),
+                Record::Message(Box::new(reminder())),
+                Record::Message(Box::new(truncated_assistant("b"))),
+                Record::Message(Box::new(reminder())),
+                Record::Message(Box::new(Message::assistant_with_tools(
+                    "",
+                    vec![ToolCall {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        arguments: json!({"text": "pong"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    }],
+                ))),
+                Record::Message(Box::new(Message::tool_result("c1", "echo", "pong"))),
+                Record::Message(Box::new(truncated_assistant("c"))),
+                Record::Message(Box::new(reminder())),
+            ],
+        );
+        // The budget (3) is already spent; the resumed turn must end `MaxTokens`
+        // without issuing another continuation request. The single scripted
+        // `cut_text` serves the post-tool continuation that the logged reminder
+        // drives; the resumed turn appends the final logged chunk, hits the
+        // spent budget, and stops.
+        let (mut agent, seen) = agent(vec![cut_text("c", 50)], dir.path());
+        agent.load_session("budget").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::MaxTokens, "the spent budget ends the turn at the cap");
+        // Only the post-tool continuation ran; no request is sent once the
+        // budget is spent.
+        assert_eq!(seen.lock().unwrap().len(), 1, "one continuation request, then the budget stops the turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_restores_continuation_state_before_session_start_context() {
+        // A resume `SessionStart` hook that supplies context appends a user
+        // message *after* the persisted turn tail. The continuation scan must
+        // read the messages logged *before* that hook context, or it stops at
+        // the hook boundary and loses the truncated prefix (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let settings = json!({
+            "hooks": {
+                "SessionStart": [ { "matcher": "resume", "hooks": [ { "type": "command", "command": "echo hook-context" } ] } ]
+            }
+        });
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), serde_json::to_string(&settings).unwrap()).unwrap();
+        crashed_session(
+            dir.path(),
+            "hook-resume",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("partial "))),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![text("done")], dir.path());
+        agent.load_claude_hooks(dir.path());
+        agent.load_session("hook-resume").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "partial done", "the prefix is restored despite the hook context");
+        // The model was called to continue (the turn did not short-circuit),
+        // and the SessionStart context was still delivered.
+        let request = &seen.lock().unwrap()[0];
+        assert!(
+            request.iter().any(|m| m.role == Role::User && m.content.contains("hook-context")),
+            "SessionStart context is still delivered: {request:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_stops_reconstruction_at_a_stop_hook_reprompt() {
+        // A Stop-hook re-prompt is `auto_initiated` like a continuation
+        // reminder, but it begins a NEW answer segment. A logged truncated
+        // `stale` chunk, a Stop-hook prompt, and a clean `fresh` reply must
+        // replay as just `fresh` — the scan must stop at the Stop-hook prompt,
+        // not reach back into the discarded `stale` prefix (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        crashed_session(
+            dir.path(),
+            "stop-hook",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("stale"))),
+                // A Stop-hook re-prompt: auto_initiated but NOT a continuation.
+                Record::Message(Box::new(Message::user(&reminders::wrap("stop-hook reason")).auto_initiated())),
+                Record::Message(Box::new(Message::assistant("fresh"))),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![], dir.path());
+        agent.load_session("stop-hook").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "fresh", "the Stop-hook segment is not prefixed by the discarded chunk");
+        assert!(seen.lock().unwrap().is_empty(), "a recorded clean answer is not re-run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_before_a_stop_hook_reply_does_not_restore_the_discarded_prefix() {
+        // The second crash point: a truncated `stale` chunk and a Stop-hook
+        // re-prompt are logged, then the crash lands BEFORE the fresh reply.
+        // The resumed turn continues from the Stop-hook prompt; the seeding
+        // scan must NOT restore the discarded `stale` prefix into the new
+        // answer (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        crashed_session(
+            dir.path(),
+            "stop-hook-seed",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("stale"))),
+                // The Stop-hook re-prompt is the last logged message.
+                Record::Message(Box::new(Message::user(&reminders::wrap("stop-hook reason")).auto_initiated())),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![text("fresh")], dir.path());
+        agent.load_session("stop-hook-seed").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "fresh", "the continued answer is not prefixed by the discarded chunk");
+        assert_eq!(seen.lock().unwrap().len(), 1, "the model is called once to answer the Stop-hook prompt");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_compaction_restores_the_persisted_continuation() {
+        // A mid-turn compaction folds the truncated chunks into the summary, so
+        // the conversation tail no longer holds them. The continuation state
+        // persisted in the `Replace` record must still restore the answer prefix
+        // and the turn-wide count, so the resumed turn stitches the whole answer
+        // (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "compact-resume").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        // The in-flight turn had two truncated chunks (count 2, text "one two ")
+        // when a compaction folded them away; the Replace record carries that
+        // state and keeps the pending input alive at the restated position.
+        log.append(&Record::Replace {
+            messages: vec![
+                Message::system("sys"),
+                Message::user("summary"),
+                Message::user("run it"), // restated pending input
+            ],
+            pending_position: Some(2),
+            summarized: Some((2, 6)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: Some(("one two ".to_string(), 2)),
+            recorded_at: session::now(),
+        })
+        .unwrap();
+        drop(log);
+        // The resumed turn continues from the restored prefix and count.
+        let (mut agent, seen) = agent(vec![text("three")], dir.path());
+        agent.load_session("compact-resume").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "one two three", "the persisted prefix is restored despite the compaction");
+        assert_eq!(seen.lock().unwrap().len(), 1, "the model is called once to finish the turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_compaction_with_a_spent_budget_ends_max_tokens() {
+        // A crash after a mid-turn compaction that followed the budget-spending
+        // chunk: the persisted count is already at the cap, so the recovered
+        // turn must end `MaxTokens` WITHOUT calling the model again (issue
+        // #114).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "compact-spent").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![
+                Message::system("sys"),
+                Message::user("summary"),
+                Message::user("run it"),
+                // The last logged chunk was truncated (the crash landed before
+                // its reminder), so the turn was mid-continuation.
+                Message { stop_reason: Some("length".into()), ..Message::assistant("tail") },
+            ],
+            pending_position: Some(2),
+            summarized: Some((2, 6)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: Some(("one two three ".to_string(), MAX_TRUNCATED_CONTINUATIONS)),
+            recorded_at: session::now(),
+        })
+        .unwrap();
+        drop(log);
+        let (mut agent, seen) = agent(vec![text("should not be called")], dir.path());
+        agent.load_session("compact-spent").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::MaxTokens, "the spent budget ends the recovered turn");
+        assert_eq!(outcome.response, "one two three ", "the accumulated answer is preserved");
+        assert!(seen.lock().unwrap().is_empty(), "an exhausted recovered turn makes no model call");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_compaction_replays_chunks_logged_after_the_summary() {
+        // A mid-turn compaction persisted the snapshot `("one ", 1)`, then the
+        // turn logged a *further* truncated chunk and its reminder before the
+        // crash. Recovery must replay those post-compaction records over the
+        // snapshot — not stop at the persisted state — so the later chunk and
+        // its spent continuation are not lost (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "compact-extra").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::system("sys"), Message::user("summary"), Message::user("run it")],
+            pending_position: Some(2),
+            summarized: Some((2, 6)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: Some(("one ".to_string(), 1)),
+            recorded_at: session::now(),
+        })
+        .unwrap();
+        // Logged *after* the compaction: a second truncated chunk and its
+        // reminder, then the crash.
+        log.append(&Record::Message(Box::new(truncated_assistant("two ")))).unwrap();
+        log.append(&Record::Message(Box::new(
+            Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation(),
+        )))
+        .unwrap();
+        drop(log);
+        let (mut agent, seen) = agent(vec![text("three")], dir.path());
+        agent.load_session("compact-extra").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "one two three", "the post-compaction chunk is folded into the whole answer");
+        assert_eq!(seen.lock().unwrap().len(), 1, "the model is called once to finish the turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_compaction_resets_the_prefix_on_a_post_summary_tool_run() {
+        // A post-compaction tool run begins a new answer segment, so the
+        // persisted continuation prefix must be dropped from the eventual text
+        // answer — its tool-call markup must not leak into it, even across the
+        // compaction boundary (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "compact-tool").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::system("sys"), Message::user("summary"), Message::user("run it")],
+            pending_position: Some(2),
+            summarized: Some((2, 6)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: Some(("one ".to_string(), 1)),
+            recorded_at: session::now(),
+        })
+        .unwrap();
+        // Logged after the compaction: a tool run that resets the answer
+        // segment, then the crash before the fresh answer.
+        log.append(&Record::Message(Box::new(Message::assistant_with_tools(
+            "",
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "echo".into(),
+                arguments: json!({"text": "pong"}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+        ))))
+        .unwrap();
+        log.append(&Record::Message(Box::new(Message::tool_result("c1", "echo", "pong")))).unwrap();
+        drop(log);
+        let (mut agent, seen) = agent(vec![text("fresh")], dir.path());
+        agent.load_session("compact-tool").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "fresh", "the post-tool answer is not prefixed by the discarded continuation");
+        assert_eq!(seen.lock().unwrap().len(), 1, "the model is called once after the tool run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_compaction_replays_a_logged_clean_final_answer() {
+        // A clean final answer logged *after* a mid-turn compaction, with the
+        // crash before `TurnEnd`. The replay shortcut (no model call) must fold
+        // the persisted snapshot prefix back in, not record only the final
+        // chunk — the shortcut must be checkpoint-aware too (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "compact-clean").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::system("sys"), Message::user("summary"), Message::user("run it")],
+            pending_position: Some(2),
+            summarized: Some((2, 6)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: Some(("one ".to_string(), 1)),
+            recorded_at: session::now(),
+        })
+        .unwrap();
+        // The clean final chunk logged after the compaction; the crash landed
+        // before `TurnEnd`.
+        log.append(&Record::Message(Box::new(Message::assistant("done")))).unwrap();
+        drop(log);
+        let (mut agent, seen) = agent(vec![text("should not be called")], dir.path());
+        agent.load_session("compact-clean").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "one done", "the replay shortcut folds the persisted prefix into the answer");
+        assert!(seen.lock().unwrap().is_empty(), "a recorded answer is replayed, not re-run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_the_third_cutoff_still_issues_the_last_continuation() {
+        // No compaction: a crash after the third truncated chunk but before its
+        // continuation reminder was logged. Only *two* reminders were scheduled,
+        // so the live loop would have incremented to the third and requested a
+        // fourth chunk — recovery must match it and issue that request, not
+        // miscount the three truncated *replies* as three scheduled
+        // continuations and end `MaxTokens` a request early (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let reminder = || Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation();
+        crashed_session(
+            dir.path(),
+            "third-cutoff",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("a"))),
+                Record::Message(Box::new(reminder())),
+                Record::Message(Box::new(truncated_assistant("b"))),
+                Record::Message(Box::new(reminder())),
+                // The third truncated chunk, then the crash before its reminder.
+                Record::Message(Box::new(truncated_assistant("c"))),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![text("d")], dir.path());
+        agent.load_session("third-cutoff").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn, "the budget still had room for the fourth request");
+        assert_eq!(outcome.response, "abcd", "the final chunk is stitched onto the recovered prefix");
+        // The recovered turn re-pushed the missing reminder and issued the
+        // fourth continuation request that completed the answer.
+        assert_eq!(seen.lock().unwrap().len(), 1, "one continuation request finishes the turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_with_a_spent_budget_before_turn_end_ends_max_tokens() {
+        // No compaction: a crash after the fourth (budget-spending) truncated
+        // chunk but before `TurnEnd`. Three reminders were scheduled (the cap),
+        // so the recovered turn must end `MaxTokens` without another model call
+        // — a clean reply would otherwise be recorded `EndTurn`, hiding the
+        // cut-off (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let reminder = || Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation();
+        crashed_session(
+            dir.path(),
+            "spent",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("a"))),
+                Record::Message(Box::new(reminder())),
+                Record::Message(Box::new(truncated_assistant("b"))),
+                Record::Message(Box::new(reminder())),
+                Record::Message(Box::new(truncated_assistant("c"))),
+                Record::Message(Box::new(reminder())),
+                // The fourth truncated chunk spends the budget; the crash lands
+                // before its reminder (which the cap would never schedule).
+                Record::Message(Box::new(truncated_assistant("d"))),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![text("should not be called")], dir.path());
+        agent.load_session("spent").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::MaxTokens, "the spent budget ends the recovered turn");
+        assert_eq!(outcome.response, "abcd", "the accumulated chunks are preserved");
+        assert!(seen.lock().unwrap().is_empty(), "an exhausted recovered turn makes no model call");
+    }
+
     fn echo_stream(n: usize) -> Vec<LLMResponse> {
         (1..=n)
             .map(|i| LLMResponse {
@@ -5713,6 +7135,301 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_compaction_summary_is_retried_after_learning_the_output_cap() {
+        // Compaction builds its summary request from the automatic output base
+        // but must not bypass the output-cap recovery: an unpublished cap that
+        // rejects the over-budget summary must be learned and the summary
+        // retried at the lower value, not dropped to the lost-history fallback
+        // (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = OutputCapClient {
+            cap: 8_000,
+            seen_max_tokens: seen.clone(),
+            // `clone()`d each call, so the retried summary still returns a
+            // non-empty body.
+            response: Mutex::new(Some(text("SUMMARY: compacted"))),
+            on_reject: Mutex::new(None),
+        };
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.tools().register(
+            ToolDefinition::new("echo", "echo", json!({"type": "object"})),
+            Box::new(|args| Ok(json!(args["text"].as_str().unwrap_or("").to_string()))),
+        );
+        agent.new_session().unwrap();
+        // A turn with some history to fold. The turn's own request fits the cap;
+        // only the larger summary budget is rejected.
+        agent.send_message("ping").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert_eq!(report.fallback, None, "the summary succeeded on retry, not the dropped-history fallback");
+        let sent = seen.lock().unwrap().clone();
+        let over = sent.iter().filter(|&&m| m > 8_000).count();
+        assert!(over >= 1, "the over-cap summary was attempted first: {sent:?}");
+        let last = *sent.last().unwrap();
+        assert!(last <= 8_000, "the retried summary sent within the learned cap: {sent:?}");
+    }
+
+    /// A client whose output-cap rejection carries NO parseable numeric limit,
+    /// so the fallback path (halving) runs. Rejects only a *summary* request
+    /// (detected by the compaction system prompt) over `cap`, so the setup chat
+    /// turn is unaffected.
+    struct NumberlessCapClient {
+        cap: i64,
+        seen_max_tokens: Arc<Mutex<Vec<i64>>>,
+        response: Mutex<Option<LLMResponse>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for NumberlessCapClient {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            let max_tokens = request.max_tokens.unwrap_or(0);
+            let is_summary =
+                request.messages.first().is_some_and(|m| m.role == Role::System && m.content.contains("compacting"));
+            if is_summary {
+                self.seen_max_tokens.lock().unwrap().push(max_tokens);
+            }
+            if is_summary && max_tokens > self.cap {
+                // No number for `output_cap_from_error` to parse: the fallback
+                // must derive the cap from the sent budget, not the chat base.
+                anyhow::bail!("max_tokens is too large for this model");
+            }
+            Ok(self.response.lock().unwrap().clone().unwrap_or_default())
+        }
+        fn model_name(&self) -> &str {
+            "scripted"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+        fn kind(&self) -> Option<providers::ProviderKind> {
+            Some(providers::ProviderKind::Openai)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_compaction_summary_cap_fallback_halves_the_sent_budget() {
+        // With no numeric limit in the rejection, the fallback must halve the
+        // budget the summary request actually *sent* (12,288 here), not the
+        // chat base. Halving the 32,768 base infers 16,384 — not below the
+        // 12,288 sent budget — so `learned < budget` is false and the retry is
+        // skipped, dropping history (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // The real cap (7,000) sits just below the 12,288 summary budget, so
+        // the first summary is rejected; the halved-budget retry (6,144) fits.
+        // A fallback that wrongly halves the 32,768 chat base infers 16,384 —
+        // not below the 12,288 sent budget — so `learned < budget` is false and
+        // the retry is skipped, dropping history (issue #114).
+        let client = NumberlessCapClient {
+            cap: 7_000,
+            seen_max_tokens: seen.clone(),
+            response: Mutex::new(Some(text("SUMMARY: compacted"))),
+        };
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.tools().register(
+            ToolDefinition::new("echo", "echo", json!({"type": "object"})),
+            Box::new(|args| Ok(json!(args["text"].as_str().unwrap_or("").to_string()))),
+        );
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert_eq!(report.fallback, None, "the summary succeeded on the halved-budget retry: {report}");
+        let sent = seen.lock().unwrap().clone();
+        // Only summary requests are recorded by this client.
+        assert!(sent.len() >= 2, "an over-cap summary, then a retry: {sent:?}");
+        assert_eq!(sent[0], 12_288, "the first summary sent the full budget over the cap: {sent:?}");
+        // The retry halved the *sent* summary budget (12,288 → 6,144), not the
+        // 32,768 chat base (which would give 16,384 — not below 12,288 — and
+        // skip the retry, dropping history).
+        assert_eq!(sent[1], 6_144, "the retry halved the sent budget: {sent:?}");
+        assert!(sent[1] <= 7_000, "the retried summary fits the cap: {sent:?}");
+    }
+
+    /// A client that rejects its FIRST chat request with an output-cap error
+    /// carrying no parseable numeric limit (so the halving fallback runs), then
+    /// succeeds. Records every request's `max_tokens`.
+    struct ChatCapFallbackClient {
+        seen_max_tokens: Arc<Mutex<Vec<i64>>>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for ChatCapFallbackClient {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            self.seen_max_tokens.lock().unwrap().push(request.max_tokens.unwrap_or(0));
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                // No number for `output_cap_from_error` to parse: the fallback
+                // must derive the cap from the sent budget, not the chat base.
+                anyhow::bail!("max_tokens is too large for this model");
+            }
+            Ok(text("recovered"))
+        }
+        fn model_name(&self) -> &str {
+            "scripted"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+        fn kind(&self) -> Option<providers::ProviderKind> {
+            Some(providers::ProviderKind::Openai)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chat_output_cap_fallback_halves_the_sent_budget() {
+        // A chat turn whose request is context-clamped below the 32,768 base is
+        // rejected with an output-cap error carrying no numeric limit. The
+        // fallback must halve the budget the request actually *sent*
+        // (`request_max_tokens`), not the unclamped base: halving the base
+        // lands *above* the clamped request, so `learned < request` is false,
+        // the retry is skipped, and the turn fails instead of recovering (issue
+        // #114).
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = ChatCapFallbackClient { seen_max_tokens: seen.clone(), calls: Arc::new(Mutex::new(0)) };
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            // A large base with a small total window clamps the request well
+            // below the base, so halving the base cannot lower it.
+            max_tokens: 32_768,
+            context_window: Some(16_000),
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.new_session().unwrap();
+        let response = agent.send_message("ping").await.unwrap();
+        assert_eq!(response, "recovered", "the context-clamped retry recovered the turn");
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "an over-cap request, then the halved retry: {sent:?}");
+        assert!(sent[0] < 32_768, "the request was context-clamped below the base: {sent:?}");
+        // The crux: the clamped request sits at or below the base's half, so a
+        // base-derived fallback (16,384) would not lower it and the retry would
+        // be skipped — only halving the *sent* budget recovers the turn.
+        assert!(sent[0] <= 16_384, "the base's half would not lower the clamped request: {sent:?}");
+        assert_eq!(sent[1], sent[0] / 2, "the retry halves the sent budget, not the base: {sent:?}");
+    }
+
+    /// A client that rejects the FIRST summary request with a numeric
+    /// output-cap error (so the summary is retried) and, on that same call,
+    /// queues a `/model` switch — the interleaving where a switch lands while
+    /// the first summary attempt is in flight (issue #114).
+    struct SwitchOnSummaryClient {
+        cap: i64,
+        control: Mutex<Option<TurnControl>>,
+        summary_calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for SwitchOnSummaryClient {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            let max_tokens = request.max_tokens.unwrap_or(0);
+            let is_summary =
+                request.messages.first().is_some_and(|m| m.role == Role::System && m.content.contains("compacting"));
+            if is_summary {
+                let mut calls = self.summary_calls.lock().unwrap();
+                *calls += 1;
+                if *calls == 1 {
+                    // Queue a `/model` switch while this first summary attempt is
+                    // "in flight", then reject it for exceeding the cap.
+                    self.control.lock().unwrap().as_ref().unwrap().set_model("mock/switched");
+                    anyhow::bail!(
+                        "max_tokens: {max_tokens} > {}, which is the maximum allowed number of output tokens",
+                        self.cap
+                    );
+                }
+            }
+            Ok(text("SUMMARY: compacted"))
+        }
+        fn model_name(&self) -> &str {
+            "scripted"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+        fn kind(&self) -> Option<providers::ProviderKind> {
+            Some(providers::ProviderKind::Openai)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_compaction_summary_retry_honours_a_pending_model_switch() {
+        // A `/model` queued while the first summary attempt awaits its
+        // output-cap rejection must be honoured before the retry: the retry
+        // goes to the NEW model, not the one the user switched away from
+        // (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let summary_calls = Arc::new(Mutex::new(0usize));
+        let client =
+            SwitchOnSummaryClient { cap: 8_000, control: Mutex::new(None), summary_calls: summary_calls.clone() };
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            ..Config::default()
+        };
+        let slot = Arc::new(client);
+        struct Shared(Arc<SwitchOnSummaryClient>);
+        #[async_trait]
+        impl LLMClient for Shared {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                Box::new(Shared(self.0.clone()))
+            }
+            async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+                self.0.chat(request).await
+            }
+            fn model_name(&self) -> &str {
+                "scripted"
+            }
+            fn provider_name(&self) -> &str {
+                "test"
+            }
+            fn kind(&self) -> Option<providers::ProviderKind> {
+                Some(providers::ProviderKind::Openai)
+            }
+        }
+        let mut agent = Agent::new(Box::new(Shared(slot.clone())), config);
+        *slot.control.lock().unwrap() = Some(agent.control());
+        agent.tools().register(
+            ToolDefinition::new("echo", "echo", json!({"type": "object"})),
+            Box::new(|args| Ok(json!(args["text"].as_str().unwrap_or("").to_string()))),
+        );
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert_eq!(report.fallback, None, "the summary succeeded on the new model: {report}");
+        // Exactly one summary attempt went to the original client (the rejected
+        // one); the retry was applied on the switched-to mock client.
+        assert_eq!(*summary_calls.lock().unwrap(), 1, "only the rejected attempt hit the old model");
+        assert_eq!(agent.model_name(), "switched", "the retry honoured the queued switch");
+        assert_eq!(agent.control().take_model_request(), None, "the switch was consumed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_summary_cut_off_at_the_output_limit_is_flagged() {
         // A reasoning model can spend most of the summary's output budget
         // thinking; a summary that stops at the limit must say it is
@@ -6580,6 +8297,95 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn an_unset_max_tokens_defaults_to_the_models_published_output_limit() {
+        // No configured `max_tokens` (0 = unset): the request defaults to the
+        // model's own output limit reported by the endpoint, not an arbitrary
+        // small number. A configured value overrides it, and the context clamp
+        // still applies in both cases.
+        let dir = tempfile::tempdir().unwrap();
+        let window = 200_000;
+        let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 4_000, dir.path());
+        agent.config_mut().max_tokens = 0;
+        agent.config_mut().context_window = None;
+        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+            tokens: window,
+            source: "Copilot /models max_context_window_tokens".into(),
+            cap: ContextCap::Total,
+            total_tokens: None,
+            max_output_tokens: Some(64_000),
+        });
+        assert_eq!(agent.effective_max_tokens(), 64_000);
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        // The roomy window leaves the published limit unclamped.
+        assert_eq!(seen.lock().unwrap()[0], (Some(64_000), false));
+
+        // A configured value overrides the published limit.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 4_000, dir.path());
+        agent.config_mut().context_window = None;
+        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+            tokens: window,
+            source: "Copilot /models max_context_window_tokens".into(),
+            cap: ContextCap::Total,
+            total_tokens: None,
+            max_output_tokens: Some(64_000),
+        });
+        // budgeted_agent configures max_tokens = 16_384.
+        assert_eq!(agent.effective_max_tokens(), 16_384);
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(seen.lock().unwrap()[0], (Some(16_384), false));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unset_max_tokens_uses_a_known_model_cap_before_the_large_fallback() {
+        // gpt-4o / gpt-4o-mini cap output at 16,384 but do not publish it via
+        // `/models`. With no configured or detected limit the automatic default
+        // must honour that known cap, not the large unknown-model fallback that
+        // the API would reject for a short prompt (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _seen) = budgeted_agent(vec![text("done")], 200_000, 4_000, dir.path());
+        agent.config_mut().max_tokens = 0;
+        assert!(agent.detected_max_output().is_none(), "no endpoint-published limit in this test");
+        agent.config_mut().model = "gpt-4o-mini".into();
+        assert_eq!(agent.effective_max_tokens(), 16_384);
+        // An unknown model still gets the large fallback, unchanged.
+        agent.config_mut().model = "some-unlisted-model".into();
+        assert_eq!(agent.effective_max_tokens(), DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_configured_window_preserves_the_probed_output_limit() {
+        // With a configured context window the window probe is skipped and the
+        // detected window stays empty, but the endpoint's published output limit
+        // lives in its own slot so the automatic max_tokens still honours it
+        // instead of collapsing to the large fallback (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _seen) = budgeted_agent(vec![text("done")], 200_000, 4_000, dir.path());
+        agent.config_mut().max_tokens = 0;
+        // The configured-window probe path leaves the detected window empty.
+        assert!(agent.detected_window.lock().unwrap().is_none());
+        // ...yet the output limit it read from the shared `/models` entry stands.
+        *agent.reported_max_output.lock().unwrap() = Some(16_000);
+        assert_eq!(agent.detected_max_output(), Some(16_000));
+        assert_eq!(agent.effective_max_tokens(), 16_000);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unset_max_tokens_falls_back_to_a_large_default_when_unpublished() {
+        // No configured limit, no published one, and no *known* cap for the
+        // model name: the large fallback is used, far above the old 4096
+        // default, still clamped to the context window (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _seen) = budgeted_agent(vec![text("done")], 200_000, 4_000, dir.path());
+        agent.config_mut().max_tokens = 0;
+        agent.config_mut().model = "some-unlisted-model".into();
+        assert_eq!(agent.effective_max_tokens(), DEFAULT_MAX_OUTPUT_TOKENS);
+        const { assert!(DEFAULT_MAX_OUTPUT_TOKENS > 4096) };
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn prompt_only_window_does_not_shrink_max_tokens() {
         // A prompt-only window (GitHub Copilot's `max_prompt_tokens`) caps the
         // prompt alone, so the output reservation is not carved out of it: even
@@ -6594,6 +8400,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: None,
+            max_output_tokens: None,
         });
         agent.new_session().unwrap();
         agent.run_turn(Some("in-1"), "go").await.unwrap();
@@ -6622,6 +8429,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: None,
+            max_output_tokens: None,
         });
         agent.learned_window = Some(learned);
         agent.new_session().unwrap();
@@ -6655,6 +8463,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: Some(combined),
+            max_output_tokens: None,
         });
         agent.new_session().unwrap();
         agent.run_turn(Some("in-1"), &"w".repeat(384_000)).await.unwrap();
@@ -6686,6 +8495,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: Some(combined),
+            max_output_tokens: None,
         });
         agent.new_session().unwrap();
         // Compactable history: a large earlier exchange. The running prompt is
@@ -6721,6 +8531,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: None,
+            max_output_tokens: None,
         });
         agent.new_session().unwrap();
         // A ~98.5K-token prompt: over the margin-protected limit (98K) but under
@@ -6756,6 +8567,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: Some(advertised),
+            max_output_tokens: None,
         });
         agent.learned_window = Some(learned);
         agent.new_session().unwrap();
@@ -6791,6 +8603,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: None,
+            max_output_tokens: None,
         });
         agent.learned_window = Some(learned);
         agent.new_session().unwrap();
@@ -7288,10 +9101,10 @@ mod tests {
             }
             async fn detect_capabilities(
                 &self,
-            ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>)
+            ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>)
             {
                 self.calls.lock().unwrap().push("capabilities");
-                (Some(DetectedWindow::total(65_536, "test")), None, None)
+                (Some(DetectedWindow::total(65_536, "test")), None, None, None)
             }
             async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
                 self.calls.lock().unwrap().push("thinking");
@@ -8982,6 +10795,31 @@ mod tests {
         let n = conversation.len();
         assert_eq!(conversation[n - 3].content, "first draft");
         assert_eq!(conversation[n - 2].content, "make it shorter");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_steer_between_continuations_drops_the_cut_off_prefix() {
+        // A length-truncated chunk schedules its continuation, then a steer
+        // lands *between* that scheduling and the next iteration's absorb —
+        // after the post-response steer check already evaluated no steer. The
+        // absorbed steer begins a new answer segment, so the revised answer
+        // must NOT be prefixed by the discarded cut-off chunk (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = agent(vec![cut_text("cut ", 50), text("revised")], dir.path());
+        let control = agent.control();
+        // Fires right after the cut-off chunk schedules its reminder, mimicking
+        // a steer that arrives in the window the post-response check just
+        // missed.
+        agent.after_continuation_scheduled = Some(Box::new(move || control.steer("change course", None)));
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(None, "write").await.unwrap();
+        assert_eq!(outcome.response, "revised", "the steered answer is not prefixed by the discarded cut-off chunk");
+        assert_eq!(seen.lock().unwrap().len(), 2, "the cut-off chunk, then the steered continuation");
+        let conversation = agent.conversation();
+        assert!(
+            conversation.iter().any(|m| m.role == Role::User && m.content == "change course"),
+            "the steer was absorbed into the turn: {conversation:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

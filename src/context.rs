@@ -307,6 +307,24 @@ pub fn window_for_model(model: &str) -> Option<usize> {
     table.iter().find(|(needle, _)| m.contains(needle)).map(|(_, window)| *window)
 }
 
+/// A known maximum output-token cap for a model whose endpoint does **not**
+/// publish one (issue #114). The automatic `max_tokens` default prefers the
+/// endpoint-published limit; when none is published it must not blindly send
+/// the large [`DEFAULT_MAX_OUTPUT_TOKENS`](crate::agent) fallback, which exceeds
+/// the real output cap of several supported models — native OpenAI `gpt-4o` /
+/// `gpt-4o-mini`, for instance, allow 16,384 output tokens but do not expose
+/// that through `/models`, so an unset `max_tokens` with a short prompt would
+/// otherwise send an over-cap request the API rejects. Only well-established
+/// caps are listed; an unknown model still falls back to the large default.
+pub fn output_limit_for_model(model: &str) -> Option<usize> {
+    let m = model.to_lowercase();
+    // Most specific needles first: substring matching must resolve, e.g.,
+    // `gpt-4-turbo` before the broader `gpt-4` family would, and never let a
+    // narrow cap shadow a larger one by accident.
+    let table: &[(&str, usize)] = &[("gpt-4o", 16_384), ("gpt-4-turbo", 4_096), ("gpt-3.5", 4_096)];
+    table.iter().find(|(needle, _)| m.contains(needle)).map(|(_, limit)| *limit)
+}
+
 /// Does this provider error say the request did not fit the context window?
 pub fn is_context_overflow(error: &str) -> bool {
     let e = error.to_lowercase();
@@ -334,6 +352,50 @@ pub fn limit_from_error(error: &str) -> Option<usize> {
         r"(?i)> ?(\d+) maximum",
         r"(?i)context window (?:of|is) (\d+)",
         r"(?i)limit of (\d+) tokens",
+    ];
+    patterns.iter().find_map(|p| Regex::new(p).ok()?.captures(error)?.get(1)?.as_str().parse().ok())
+}
+
+/// Does this provider error say the request's `max_tokens` exceeded the model's
+/// **output-token** cap (as opposed to the prompt overflowing the context
+/// window)? With automatic `max_tokens` the agent falls back to the large
+/// `DEFAULT_MAX_OUTPUT_TOKENS` for a model whose endpoint publishes no output
+/// limit; a model whose real cap is smaller rejects every request until a
+/// background capability probe lands, so this lets the agent learn the cap from
+/// the rejection and retry (issue #114). Deliberately narrow — it must not
+/// match a context-window overflow, which has its own recovery path.
+pub fn is_output_cap_error(error: &str) -> bool {
+    let e = error.to_lowercase();
+    [
+        "maximum allowed number of output tokens",
+        "maximum number of output tokens",
+        "maximum output tokens",
+        "max_output_tokens",
+        "completion tokens",
+        "max_tokens is too large",
+        "max_tokens too large",
+        "max_tokens must be less than or equal to",
+        "max_tokens: ",
+    ]
+    .iter()
+    .any(|needle| e.contains(needle))
+}
+
+/// The output-token cap stated in an output-cap rejection error, if any.
+pub fn output_cap_from_error(error: &str) -> Option<usize> {
+    let patterns = [
+        // Anthropic: "max_tokens: 32768 > 8192, which is the maximum …".
+        r"(?i)max_tokens:\s*\d+\s*>\s*(\d+)",
+        // OpenAI: "supports at most 16384 completion tokens".
+        r"(?i)at most (\d+) completion tokens",
+        // "maximum allowed number of output tokens is 8192".
+        r"(?i)output tokens(?: for [^ ]+)? is (\d+)",
+        r"(?i)maximum output tokens (?:is|of) (\d+)",
+        // Azure/Copilot: "max_tokens must be less than or equal to 4096".
+        r"(?i)max_tokens must be less than or equal to (\d+)",
+        // "max_tokens is too large: 32768. … at most 16384 …" already covered;
+        // a bare "maximum of 16384 output tokens".
+        r"(?i)maximum of (\d+) (?:completion|output) tokens",
     ];
     patterns.iter().find_map(|p| Regex::new(p).ok()?.captures(error)?.get(1)?.as_str().parse().ok())
 }
@@ -545,6 +607,23 @@ mod tests {
     }
 
     #[test]
+    fn detects_output_cap_errors_and_their_limits() {
+        // Real provider shapes for an over-cap `max_tokens` (issue #114).
+        let anthropic = "HTTP 400: max_tokens: 32768 > 8192, which is the maximum allowed number of output tokens for claude-3-5-haiku";
+        let openai = "HTTP 400: max_tokens is too large: 32768. This model supports at most 16384 completion tokens";
+        let azure = "HTTP 400: max_tokens must be less than or equal to 4096";
+        for (error, cap) in [(anthropic, 8_192), (openai, 16_384), (azure, 4_096)] {
+            assert!(is_output_cap_error(error), "{error}");
+            assert_eq!(output_cap_from_error(error), Some(cap), "{error}");
+        }
+        // A context-window overflow is NOT an output-cap error: it has its own
+        // recovery path and must not be misrouted.
+        let overflow = "HTTP 400: This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.";
+        assert!(!is_output_cap_error(overflow), "{overflow}");
+        assert!(!is_output_cap_error("HTTP 401: invalid api key"));
+    }
+
+    #[test]
     fn transcript_keeps_the_newest_messages() {
         let messages: Vec<Message> =
             (0..50).map(|i| Message::user(&format!("message {i} {}", "x".repeat(100)))).collect();
@@ -575,5 +654,19 @@ mod tests {
         assert_eq!(window_for_model("claude-sonnet-4-5"), Some(200_000));
         assert_eq!(window_for_model("gpt-4.1-mini"), Some(1_047_576));
         assert_eq!(window_for_model("llama3"), None);
+    }
+
+    #[test]
+    fn model_output_limits() {
+        // Known caps for models whose endpoint does not publish one (issue #114).
+        assert_eq!(output_limit_for_model("gpt-4o"), Some(16_384));
+        assert_eq!(output_limit_for_model("gpt-4o-mini"), Some(16_384));
+        assert_eq!(output_limit_for_model("GPT-4O-MINI"), Some(16_384), "case-insensitive");
+        assert_eq!(output_limit_for_model("gpt-4-turbo"), Some(4_096));
+        assert_eq!(output_limit_for_model("gpt-3.5-turbo"), Some(4_096));
+        // Models with large or unknown caps keep the large fallback (None here).
+        assert_eq!(output_limit_for_model("gpt-4.1"), None);
+        assert_eq!(output_limit_for_model("claude-sonnet-4-5"), None);
+        assert_eq!(output_limit_for_model("some-unlisted-model"), None);
     }
 }

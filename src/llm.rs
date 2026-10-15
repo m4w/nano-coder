@@ -79,6 +79,24 @@ pub struct Message {
     /// For tool results: the tool failed (or never finished).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// A harness-injected automatic follow-up (a truncated-output continuation
+    /// or a Claude Stop-hook re-prompt), not a turn the user initiated. Carried
+    /// so a provider that bills per user-initiated request (Copilot) can send
+    /// `X-Initiator: agent` for it even though the reminder keeps `Role::User`
+    /// on the wire, instead of being charged a premium request mid-turn
+    /// (issue #114). Not sent to providers as content; log only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_initiated: bool,
+    /// Marks *which* kind of automatic follow-up this `auto_initiated` user
+    /// message is: `true` only for a truncated-output continuation reminder
+    /// (the "your reply was cut off, continue" nudge), `false` for a Claude
+    /// Stop-hook re-prompt. Recovery's backward scan steps over continuation
+    /// reminders to rebuild a cut-off answer, but must STOP at a Stop-hook
+    /// re-prompt — that begins a *new* answer segment, so scanning past it
+    /// would concatenate the previous segment's discarded chunks onto the
+    /// fresh reply (issue #114). Log only; not sent to providers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub continuation: bool,
     /// Provider-specific reasoning blocks that must be replayed with this
     /// assistant message (Anthropic `thinking` blocks with signatures).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -116,6 +134,12 @@ pub struct Message {
     /// model)`. Log only; not sent to providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<String>,
+    /// Assistant messages: the provider stop reason for the request that
+    /// produced this message (`end_turn`, `length`/`max_tokens`, …). Recorded
+    /// in the session log so a turn cut off at the output-token limit is
+    /// diagnosable after the fact; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 impl Message {
@@ -126,6 +150,8 @@ impl Message {
             attachments: vec![],
             tool_calls: vec![],
             is_error: false,
+            auto_initiated: false,
+            continuation: false,
             thinking_blocks: vec![],
             tool_call_id: None,
             name: None,
@@ -136,6 +162,7 @@ impl Message {
             duration_ms: None,
             temperature: None,
             thinking_level: None,
+            stop_reason: None,
         }
     }
 
@@ -170,6 +197,24 @@ impl Message {
     /// Attach `attachments` to this (tool-result) message.
     pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    /// Mark this (user-role) reminder as a harness-injected automatic follow-up
+    /// rather than a user-initiated turn, so Copilot bills it as agent-initiated
+    /// (issue #114).
+    pub fn auto_initiated(mut self) -> Self {
+        self.auto_initiated = true;
+        self
+    }
+
+    /// Mark this (user-role) reminder as a truncated-output *continuation*
+    /// reminder specifically (implies `auto_initiated`), so recovery can tell
+    /// it apart from a Stop-hook re-prompt and rebuild the cut-off answer
+    /// across it (issue #114).
+    pub fn continuation(mut self) -> Self {
+        self.auto_initiated = true;
+        self.continuation = true;
         self
     }
 }
@@ -588,18 +633,31 @@ pub trait LLMClient: Send + Sync {
     async fn detect_vision(&self) -> Option<crate::vision::Vision> {
         None
     }
-    /// The thinking levels and vision capability the endpoint reports, probed
-    /// together but **without** the context-window follow-ups. Used when the
-    /// window is already configured, so the window probe would be discarded
-    /// anyway (and running it can add an unwanted follow-up like LM Studio's
-    /// `/api/v0/models`). A provider whose thinking and vision detections read
+    /// The thinking levels, vision capability **and** published output-token
+    /// limit the endpoint reports, probed together but **without** the
+    /// context-window follow-ups. Used when the window is already configured, so
+    /// the window probe would be discarded anyway (and running it can add an
+    /// unwanted follow-up like LM Studio's `/api/v0/models`). The output limit
+    /// is kept because it is a separate budget from the window — a configured
+    /// window must not suppress it (issue #114) — and a provider that reads it
+    /// from the same `/models` entry as thinking/vision returns it here for no
+    /// extra round trip. A provider whose thinking and vision detections read
     /// the same endpoint response (llama.cpp `/props`, Ollama `/api/show`)
     /// overrides this to fetch it once rather than probing twice serially.
-    async fn detect_thinking_and_vision(&self) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
-        (self.detect_thinking_levels().await, self.detect_vision().await)
+    async fn detect_thinking_and_vision(
+        &self,
+    ) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>) {
+        (self.detect_thinking_levels().await, self.detect_vision().await, None)
     }
-    /// The window, thinking levels and vision capability the endpoint reports,
-    /// probed together.
+    /// The window, thinking levels, vision capability **and** published
+    /// output-token limit the endpoint reports, probed together.
+    ///
+    /// The output limit is returned *independently* of the window: an endpoint
+    /// can publish an output cap on a `/models` entry that carries no
+    /// recognized context-window field (or whose window is found by a
+    /// server-specific follow-up), and that cap must survive even when the
+    /// window is `None`, exactly as the configured-window path
+    /// (`detect_thinking_and_vision`) already keeps it (issue #114).
     ///
     /// The default probes each on its own; a provider whose detections would
     /// fetch the same endpoint response (OpenAI-compatible servers probe
@@ -608,8 +666,13 @@ pub trait LLMClient: Send + Sync {
     /// not probed two or three times serially.
     async fn detect_capabilities(
         &self,
-    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
-        (self.detect_context_window().await, self.detect_thinking_levels().await, self.detect_vision().await)
+    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>) {
+        let window = self.detect_context_window().await;
+        // Keep any output cap the window carried, independent of the window
+        // itself, so the agent consumer can store it even when the window half
+        // is absent.
+        let max_output = window.as_ref().and_then(|w| w.max_output_tokens);
+        (window, self.detect_thinking_levels().await, self.detect_vision().await, max_output)
     }
     /// A boxed clone, for work that outlives the caller's borrow — e.g. the
     /// agent probing the context window in a background task after a mid-turn
@@ -651,12 +714,24 @@ pub struct DetectedWindow {
     /// prompt + output past this window, so it is enforced as a second limit.
     /// `None` for a `Total` cap, where `tokens` already is the combined window.
     pub total_tokens: Option<usize>,
+    /// The model's own maximum output tokens, when the endpoint publishes it
+    /// (GitHub Copilot's `capabilities.limits.max_output_tokens`). Used as the
+    /// default `max_tokens` when the user configured none, so a request is not
+    /// capped at an arbitrary low default below what the model allows. `None`
+    /// when the endpoint publishes no output limit.
+    pub max_output_tokens: Option<usize>,
 }
 
 impl DetectedWindow {
     /// A window that caps the whole request, prompt + output.
     pub fn total(tokens: usize, source: impl Into<String>) -> Self {
-        DetectedWindow { tokens, source: source.into(), cap: ContextCap::Total, total_tokens: None }
+        DetectedWindow {
+            tokens,
+            source: source.into(),
+            cap: ContextCap::Total,
+            total_tokens: None,
+            max_output_tokens: None,
+        }
     }
 }
 
