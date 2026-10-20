@@ -21,6 +21,20 @@ pub struct Word {
     pub glob: bool,
     /// Some part of the word was quoted or escaped.
     pub quoted: bool,
+    /// The word may expand to other than exactly one argument: it contains an
+    /// unquoted expansion or glob (word-splitting / pathname expansion), or a
+    /// `$@` / `${arr[@]}` expansion that yields multiple arguments even when
+    /// quoted. `quoted` alone does not prove single-argument — `""$x` is quoted
+    /// yet `$x` still splits — so callers that need a provably single argument
+    /// (e.g. an option value that must not smuggle extra options) check this.
+    pub splits: bool,
+    /// The word contains an expansion that can assign a shell variable when the
+    /// shell evaluates it: arithmetic `$((x = ...))` (assignment operators are
+    /// full arithmetic inside `$(( ))`) or a parameter expansion with an
+    /// assignment-capable operator (`${x:=y}`, `${x+=y}`, `${x::=y}`). Such an
+    /// expansion runs before the command it sits in, so a guard that inspects
+    /// the command's own words never sees the write.
+    pub assigns: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,9 +60,424 @@ pub struct Simple {
     pub words: Vec<Word>,
     pub redirects: Vec<Redirect>,
     pub heredocs: Vec<Heredoc>,
+    /// Set when this command was lifted out of a loop header or loop
+    /// condition's command substitution (`for f in "$(cmd)"`,
+    /// `while cmd "$(sub)"; do ...`). The parser flattens substitutions ahead
+    /// of their containing command, so such a command reaches the effect
+    /// classifier before any loop frame exists; this flag lets the classifier
+    /// still apply the loop's read-only rules to it.
+    pub loop_header_sub: bool,
+}
+
+/// Whether the words parsed so far open a loop whose header or condition runs
+/// on the parent shell. `for`/`select`/`while`/`until` begin such a loop, and a
+/// command substitution in that header/condition is subject to the loop's
+/// read-only rules even though the parser emits it first. The loop keyword can
+/// sit behind leading control-flow keywords (`if true; then for f in "$(cmd)"`,
+/// `! while ...`), so skip those first — mirroring
+/// `permissions::loop_command_offset` — rather than only inspecting the first
+/// word, or a header substitution after a control prefix slips through
+/// unflagged before the loop frame exists.
+fn opens_loop_header(words: &[Word]) -> bool {
+    for word in words {
+        if word.quoted {
+            return false;
+        }
+        match word.text.as_str() {
+            "for" | "select" | "while" | "until" => return true,
+            "!" | "if" | "then" | "else" | "elif" | "do" | "{" | "}" | "fi" | "esac" => continue,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether an arithmetic `$(( ... ))` body contains an assignment operator,
+/// which writes a shell variable when the expansion runs. Inside arithmetic,
+/// `=` and the compound forms (`+=`, `-=`, `*=`, `/=`, `%=`, `<<=`, `>>=`,
+/// `&=`, `|=`, `^=`) assign; a bare `=` is not a comparison operator there
+/// (equality is `==`), so any `=` that is not part of `==`, `<=`, `>=`, `!=`
+/// assigns. A `<<=` / `>>=` is an assignment, not the comparison `<=` / `>=`
+/// it ends with, so a `=` preceded by `<` / `>` only escapes classification as
+/// an assignment when that predecessor is not itself a shift. Nested
+/// `$( ( ... ) )` bodies arrive with their inner parens intact, so a nested
+/// assignment (`$(( (x = 1) + 2 ))`) is still seen. The prefix/postfix
+/// increment and decrement operators (`x++`, `--x`) also write their operand,
+/// so any `++` / `--` counts as an assignment too.
+pub(crate) fn arithmetic_assigns(body: &str) -> bool {
+    // `++` / `--` increment or decrement (and thus write) their operand.
+    // Arithmetic never needs two adjacent `+`/`-` for anything else (a double
+    // negation is written `- -x` with a space), so treating the bare digraph
+    // as an assignment is both correct and fail-closed.
+    if body.contains("++") || body.contains("--") {
+        return true;
+    }
+    let chars: Vec<char> = body.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '=' {
+            continue;
+        }
+        let prev = i.checked_sub(1).and_then(|p| chars.get(p)).copied();
+        let next = chars.get(i + 1).copied();
+        if next == Some('=') {
+            continue; // `==` (and the `=` of `<=`/`>=`/`!=` handled below)
+        }
+        match prev {
+            Some('=') | Some('!') => continue,
+            // `<=` / `>=` compare, but `<<=` / `>>=` assign.
+            Some('<') | Some('>') => {
+                let before = i.checked_sub(2).and_then(|p| chars.get(p)).copied();
+                if before == prev {
+                    return true; // `<<=` / `>>=`
+                }
+                continue;
+            }
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// Whether a `${ ... }` parameter-expansion body assigns its variable when the
+/// expansion runs: the assignment-capable operators `:=`, `::=`, `+=` (and
+/// `=`, which assigns only when the variable is unset — still a write) after a
+/// plain variable name or positional parameter. Test operators (`:-`, `:?`,
+/// `:+`, `-`, `?`, `+`), substring/length forms and pattern edits never
+/// assign. An array subscript (`${a[i=1]}`, `${a[0]:=x}`) is itself an
+/// arithmetic context, so a subscript that assigns — or any element
+/// assignment — writes a variable and must be flagged too.
+///
+/// The *value* of any operator and the offset/length of a substring expansion
+/// are evaluated too, so a nested expansion there runs its own writes:
+/// `${x:-$((PATH=0))}` and `${missing:-${d:=/etc}}` assign through the default,
+/// and `${text:PATH=0:1}` assigns through its arithmetic offset. Scan the whole
+/// body for a nested `$(( ... ))` / `${ ... }` that assigns, and for a
+/// substring offset/length that is an arithmetic assignment.
+fn param_expansion_assigns(body: &str) -> bool {
+    let mut chars = body.chars().peekable();
+    // `$#` is a length prefix, not the parameter name.
+    if chars.peek() == Some(&'#') && body.len() > 1 {
+        chars.next();
+    }
+    // The parameter name: a plain identifier, a positional digit, or a special
+    // parameter. Anything else (subscript, indirection) is not a simple
+    // variable assignment this check needs to model.
+    match chars.peek().copied() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {
+            while chars.peek().is_some_and(|&c| c == '_' || c.is_ascii_alphanumeric()) {
+                chars.next();
+            }
+        }
+        Some(c) if c.is_ascii_digit() => {
+            while chars.peek().is_some_and(|&c| c.is_ascii_digit()) {
+                chars.next();
+            }
+        }
+        // Indirection `${!name}` reads the variable named by `name`, but an
+        // assignment operator after the name still assigns through it:
+        // `${!ref:=/etc}` sets the variable `ref` points to. Consume the real
+        // name and fall through so the operator check below still runs —
+        // rejecting the assigning expansion does not require resolving `ref`.
+        Some('!') => {
+            chars.next();
+            match chars.peek().copied() {
+                Some(c) if c == '_' || c.is_ascii_alphabetic() => {
+                    while chars.peek().is_some_and(|&c| c == '_' || c.is_ascii_alphanumeric()) {
+                        chars.next();
+                    }
+                }
+                Some(c) if c.is_ascii_digit() => {
+                    while chars.peek().is_some_and(|&c| c.is_ascii_digit()) {
+                        chars.next();
+                    }
+                }
+                // `${!prefix@}` / `${!prefix*}` enumerate names (read-only);
+                // anything else is not a simple assignment target.
+                Some(c) if "@*".contains(c) => {
+                    chars.next();
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+        Some(c) if "@*#?$-".contains(c) => {
+            chars.next();
+        }
+        _ => return false,
+    }
+    // A subscript is an arithmetic context: `${a[i=1]}` sets `i` even when the
+    // outer expansion only reads it. Fail closed on any assigning subscript.
+    if chars.peek() == Some(&'[') {
+        chars.next();
+        let mut subscript = String::new();
+        for c in chars.by_ref() {
+            if c == ']' {
+                break;
+            }
+            subscript.push(c);
+        }
+        if arithmetic_assigns(&subscript) {
+            return true;
+        }
+    }
+    let rest: String = chars.collect();
+    if rest.starts_with("+=") || rest.starts_with('=') || rest.starts_with(":=") || rest.starts_with("::=") {
+        return true;
+    }
+    // A substring expansion `${name:offset[:length]}` evaluates *both* the
+    // offset and the length as arithmetic; either can assign (`${text:PATH=0:1}`
+    // through the offset, `${text:0:PATH=0}` through the length). The first `:`
+    // after the name opens the offset (but `:-`, `:=`, `:+`, `:?`, `::=` are
+    // operators, not substrings). Fail closed if any field assigns — not just
+    // the offset.
+    if let Some(sub) = rest.strip_prefix(':')
+        && !sub.starts_with(['-', '=', '+', '?'])
+    {
+        // `offset` runs to the next top-level `:`; `length` is the remainder.
+        // Scan every colon-separated field, so a length assignment is caught
+        // as well as an offset one.
+        if sub.split(':').any(arithmetic_assigns) {
+            return true;
+        }
+    }
+    // A nested expansion anywhere in the body runs when the outer one does, so
+    // propagate its writes: `$(( ... ))` arithmetic and `${ ... }` parameter
+    // expansions can both assign even when the outer operator only reads.
+    nested_expansion_assigns(body)
+}
+
+/// Whether any expansion nested in `body` yields one argument per element even
+/// under the outer expansion's quotes — a positional list `$@` / `$*` /
+/// `${@}` / `${*:...}` or an array list `${arr[@]}` / `${arr[*]}`. A quoted
+/// `"${x:-"$@"}"` still expands to the whole positional list, so the outer word
+/// word-splits despite being quoted. Only a *nested* form is reported: a
+/// top-level `${@}` / `${arr[@]}` body is already handled by the caller's own
+/// `[@]` / `@` check.
+fn nested_list_expansion(body: &str) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            match chars[i + 1] {
+                // A bare positional list `$@` / `$*`.
+                '@' | '*' => return true,
+                '{' => {
+                    let mut depth = 0usize;
+                    let mut j = i + 1;
+                    while j < chars.len() {
+                        match chars[j] {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth = depth.saturating_sub(1);
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    let inner: String = chars[i + 2..j].iter().collect();
+                    // This `${...}` is itself a whole-list expansion — `${@}` /
+                    // `${*:1}` (positional) or `${arr[@]}` / `${arr[*]}` (array),
+                    // each yielding one argument per element. `top_level_list`
+                    // already excludes the `${#...}` length form (a scalar
+                    // count) and only honours the outer expansion's own
+                    // subscript, so a `[@]` buried in a nested default does not
+                    // misfire here.
+                    if top_level_list(&inner) {
+                        return true;
+                    }
+                    // Otherwise keep scanning *inside* it: a positional/array
+                    // list can hide in a nested default
+                    // (`${outer:-${inner:-"$@"}}`), so skipping straight to the
+                    // closing brace would miss it. A leading `#` is the length
+                    // prefix, whose body is a scalar count — never a list.
+                    if !inner.starts_with('#') && nested_list_expansion(&inner) {
+                        return true;
+                    }
+                    i = j + 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether a `${...}` body is itself a positional/array list expansion —
+/// `${@}`, `${*}` (plain or sliced) or `${arr[@]}` / `${arr[*]}` — yielding one
+/// argument per element even when quoted. Only the *outer* expansion's own
+/// subscript counts: a `[@]` belonging to a nested expansion (`${x:-"${y[@]}"}`)
+/// is handled by the caller's `nested_list_expansion`, and a leading `#` is the
+/// length prefix (`${#arr[@]}` is the element *count*, a scalar), not a list.
+fn top_level_list(body: &str) -> bool {
+    if body.starts_with('#') {
+        return false;
+    }
+    // `${@...}` / `${*...}` (a positional list, plain or sliced).
+    if body.starts_with('@') || body.starts_with('*') {
+        return true;
+    }
+    // `${name[@]}` / `${name[*]}`: an identifier or positional digit followed
+    // directly by the whole-list subscript.
+    let mut chars = body.chars().peekable();
+    match chars.peek().copied() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {
+            while chars.peek().is_some_and(|&c| c == '_' || c.is_ascii_alphanumeric()) {
+                chars.next();
+            }
+        }
+        Some(c) if c.is_ascii_digit() => {
+            while chars.peek().is_some_and(|&c| c.is_ascii_digit()) {
+                chars.next();
+            }
+        }
+        _ => return false,
+    }
+    matches!(chars.next(), Some('[')) && matches!(chars.next(), Some('@') | Some('*')) && chars.next() == Some(']')
+}
+
+/// Whether any `$(( ... ))` or `${ ... }` nested in `body` assigns a shell
+/// variable. Only the innermost expansions matter — an outer arithmetic body is
+/// already scanned by `arithmetic_assigns` — so this walks the text, and on
+/// each nested expansion checks the assignment class for that form.
+fn nested_expansion_assigns(body: &str) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            if chars[i + 1] == '(' {
+                // `$((` arithmetic, or `$(` command substitution (whose inner
+                // commands the parser already models separately). Only the
+                // arithmetic form is an assignment context here.
+                let arith = i + 2 < chars.len() && chars[i + 2] == '(';
+                let open = i + 1;
+                let mut depth = 0usize;
+                let mut j = open;
+                while j < chars.len() {
+                    match chars[j] {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if arith {
+                    let inner: String = chars[open + 2..j].iter().collect();
+                    if arithmetic_assigns(&inner) {
+                        return true;
+                    }
+                }
+                i = j + 1;
+                continue;
+            } else if chars[i + 1] == '{' {
+                let mut depth = 0usize;
+                let mut j = i + 1;
+                while j < chars.len() {
+                    match chars[j] {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let inner: String = chars[i + 2..j].iter().collect();
+                if param_expansion_assigns(&inner) {
+                    return true;
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether the words parsed so far are inside an open `[[ ... ]]` conditional,
+/// where `<` and `>` are string-comparison operators rather than redirections.
+/// `[[` only has that meaning in command position — possibly behind leading
+/// control-flow keywords (`do [[ $a > $b ]]`, `! [[ ... ]]`, `if [[ ... ]]`,
+/// `while [[ ... ]]`, `until [[ ... ]]`, mirroring
+/// `permissions::loop_command_offset`). An `[[` that is an *operand*
+/// (`echo [[ > out`) is ordinary text, so its `>` is a real redirection and
+/// must not be treated as a comparison.
+fn in_conditional(words: &[Word]) -> bool {
+    let mut open = false;
+    let mut seen_command = false;
+    for w in words {
+        if w.quoted || w.dynamic {
+            // A quoted or computed word is never conditional syntax, and it
+            // occupies command position if none was taken yet.
+            if !seen_command {
+                seen_command = true;
+            }
+            continue;
+        }
+        match w.text.as_str() {
+            "[[" if !seen_command => {
+                open = true;
+                seen_command = true;
+            }
+            "]]" if open => open = false,
+            "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "}" | "fi" | "esac"
+                if !seen_command => {}
+            _ => seen_command = true,
+        }
+    }
+    open
 }
 
 const MAX_DEPTH: usize = 16;
+
+/// Whether an **expanding** here-document body (`<<EOF`, unquoted delimiter)
+/// contains an expansion that assigns a shell variable when the heredoc is
+/// delivered. The body is expanded like double-quoted text — `${x:=1}`,
+/// `$((x=1))`, `${text:PATH=0:1}` all write a variable — but it never passes
+/// through `word()`, so the ordinary `assigns` scan never sees it. A
+/// quoted-delimiter heredoc (`<<'EOF'`) does not expand and must not be passed
+/// here. Fails closed: a malformed/unterminated expansion returns `true`.
+pub fn heredoc_body_assigns(body: &str) -> bool {
+    let mut parser = Parser { chars: body.chars().collect(), pos: 0, depth: 0, out: Vec::new(), case_depth: 0 };
+    let mut word = Word::default();
+    while let Some(c) = parser.peek() {
+        match c {
+            // In an expanding heredoc only `$`, backtick and `\` are special;
+            // a backslash escapes the following `$`/backtick/`\`, making it
+            // literal rather than an expansion.
+            '\\' if matches!(parser.peek_at(1), Some('$' | '`' | '\\')) => parser.pos += 2,
+            '$' => {
+                if parser.dollar(&mut word, true).is_err() {
+                    return true;
+                }
+            }
+            '`' => {
+                parser.pos += 1;
+                if parser.backtick().is_err() {
+                    return true;
+                }
+            }
+            _ => parser.pos += 1,
+        }
+        if word.assigns {
+            return true;
+        }
+    }
+    word.assigns
+}
 
 /// Parse a command line into its simple commands, including those inside
 /// command substitutions.
@@ -237,6 +666,17 @@ impl Parser {
                         self.redirect(&mut current, &mut pending)?;
                         continue;
                     }
+                    // Inside `[[ ... ]]`, `&&` and `||` are conditional
+                    // conjunctions/disjunctions, not command separators
+                    // (`[[ -f m && -r m ]]` is one test). Keep them as plain
+                    // words so the conditional stays a single command until
+                    // `]]`; a single `&`/`|`/`;` still separates commands.
+                    let doubled = self.peek_at(1) == Some(c);
+                    if doubled && c != ';' && in_conditional(&current.words) {
+                        current.words.push(Word { text: format!("{c}{c}"), ..Default::default() });
+                        self.pos += 2;
+                        continue;
+                    }
                     self.pos += 1;
                     // `&&`, `||`, `|&`, `;;`, `;&`, `;;&`
                     while self.peek().is_some_and(|n| matches!(n, '&' | '|' | ';')) {
@@ -271,8 +711,20 @@ impl Parser {
                     if self.peek_at(1) == Some('(') {
                         // Process substitution <(...) / >(...).
                         self.pos += 2;
+                        let out_start = self.out.len();
                         self.substitution()?;
+                        if opens_loop_header(&current.words) {
+                            self.mark_loop_header_subs(out_start);
+                        }
                         current.words.push(Word { text: "/dev/fd/63".into(), dynamic: true, ..Default::default() });
+                    } else if in_conditional(&current.words) {
+                        // Inside `[[ ... ]]`, `<` and `>` are string-comparison
+                        // operators, not redirections (`[[ $a > $b ]]` compares,
+                        // it does not write a file named `$b`). Record the
+                        // operator as a plain word; a real redirect after `]]`
+                        // still parses normally because `]]` ends the conditional.
+                        current.words.push(Word { text: c.to_string(), ..Default::default() });
+                        self.pos += 1;
                     } else {
                         self.redirect(&mut current, &mut pending)?;
                     }
@@ -285,7 +737,12 @@ impl Parser {
                         self.redirect(&mut current, &mut pending)?;
                         continue;
                     }
+                    let in_loop_head = opens_loop_header(&current.words);
+                    let out_start = self.out.len();
                     let word = self.word()?;
+                    if in_loop_head {
+                        self.mark_loop_header_subs(out_start);
+                    }
                     if current.words.is_empty() && !word.quoted {
                         match word.text.as_str() {
                             "case" => self.case_depth += 1,
@@ -332,6 +789,18 @@ impl Parser {
         }
     }
 
+    /// Flag every command emitted since `out_start` as a loop header/condition
+    /// substitution. The parser appends a substitution's inner commands to
+    /// `out` before flushing their containing command, so these are the
+    /// commands lifted out of the loop header or condition currently being
+    /// parsed; the effect classifier must hold them to the loop's read-only
+    /// rules even though no loop frame exists when it reaches them.
+    fn mark_loop_header_subs(&mut self, out_start: usize) {
+        for simple in self.out[out_start..].iter_mut() {
+            simple.loop_header_sub = true;
+        }
+    }
+
     fn redirect(&mut self, current: &mut Simple, pending: &mut Vec<PendingHeredoc>) -> Result<(), String> {
         let start = self.pos;
         if self.eat('&') {
@@ -355,7 +824,15 @@ impl Parser {
         if self.peek().is_none_or(|c| is_operator(c) && c != '<' && c != '>') {
             return Err(format!("redirection {op} has no target"));
         }
+        // A command substitution in a redirect target of a loop header or
+        // condition (`while read x < "$(touch out)"; do ...`) runs on the parent
+        // shell, but the target is parsed here via `word()` rather than the main
+        // loop, so mark its substitutions as header substitutions too.
+        let out_start = self.out.len();
         let target = self.word()?;
+        if opens_loop_header(&current.words) {
+            self.mark_loop_header_subs(out_start);
+        }
         if op == "<<" || op == "<<-" {
             // The body belongs to the current command, which gets its index when flushed.
             // A quoted delimiter (`<<'EOF'`) disables expansion of the body.
@@ -480,8 +957,11 @@ impl Parser {
         Err(format!("unterminated {open}"))
     }
 
-    /// `$...` at the current position (the `$` not yet consumed).
-    fn dollar(&mut self, word: &mut Word) -> Result<(), String> {
+    /// `$...` at the current position (the `$` not yet consumed). `quoted` is
+    /// true when the expansion sits inside double quotes, where most expansions
+    /// stay a single argument; an unquoted expansion (and a quoted `$@` /
+    /// `${arr[@]}`) can produce multiple arguments, which sets `word.splits`.
+    fn dollar(&mut self, word: &mut Word, quoted: bool) -> Result<(), String> {
         self.pos += 1;
         match self.peek() {
             Some('(') if self.peek_at(1) == Some('(') => {
@@ -490,18 +970,53 @@ impl Parser {
                 self.eat(')');
                 word.text.push_str(&format!("$(({body}))"));
                 word.dynamic = true;
+                if !quoted {
+                    word.splits = true;
+                }
+                // Arithmetic assignment operators (`$((x = 1))`, `$((x += 1))`)
+                // write a shell variable when the expansion runs.
+                if arithmetic_assigns(&body) {
+                    word.assigns = true;
+                }
             }
             Some('(') => {
                 self.pos += 1;
                 self.substitution()?;
                 word.text.push_str("$(...)");
                 word.dynamic = true;
+                if !quoted {
+                    word.splits = true;
+                }
             }
             Some('{') => {
                 self.pos += 1;
                 let body = self.balanced('{', '}')?;
                 word.text.push_str(&format!("${{{body}}}"));
                 word.dynamic = true;
+                // `${arr[@]}` and the positional list `${@}` (plain or sliced,
+                // `${@:1}`) yield one argument per element even when quoted;
+                // any unquoted expansion word-splits. Only the *outer*
+                // expansion's own subscript counts — a `[@]`/`[*]` on a nested
+                // expansion (`${x:-"${y[@]}"}`) or a `${#...}` length prefix
+                // (`${#arr[@]}` is the count, a scalar) is not a list.
+                if !quoted || top_level_list(&body) {
+                    word.splits = true;
+                }
+                // A *nested* positional/array-list expansion inside a quoted
+                // default or alternate still expands to one argument per
+                // element: `"${missing:-"$@"}"` supplies the whole positional
+                // list (`sort -T "${missing:-"$@"}"` → `-T /tmp -oresult`),
+                // and `"${x:-"${arr[@]}"}"` likewise. The outer quotes do not
+                // collapse that list to a single argument, so mark the word
+                // splitting even when the outer expansion is quoted.
+                if quoted && nested_list_expansion(&body) {
+                    word.splits = true;
+                }
+                // `${x:=y}`, `${x+=y}` and friends assign the variable when the
+                // expansion runs.
+                if param_expansion_assigns(&body) {
+                    word.assigns = true;
+                }
             }
             Some(c) if c.is_ascii_alphanumeric() || c == '_' => {
                 word.text.push('$');
@@ -510,16 +1025,104 @@ impl Parser {
                     self.pos += 1;
                 }
                 word.dynamic = true;
+                if !quoted {
+                    word.splits = true;
+                }
             }
             Some(c) if "@*#?$!-".contains(c) => {
                 word.text.push('$');
                 word.text.push(c);
                 self.pos += 1;
                 word.dynamic = true;
+                // `$@` expands to multiple arguments even inside quotes; the
+                // other special parameters are single, but any unquoted
+                // expansion still word-splits.
+                if !quoted || c == '@' {
+                    word.splits = true;
+                }
             }
             _ => word.text.push('$'),
         }
         Ok(())
+    }
+
+    /// A single-quoted `'...'` segment (pos at the opening `'`). Everything
+    /// inside is literal, so it only marks the word quoted.
+    fn single_quote(&mut self, word: &mut Word) -> Result<(), String> {
+        self.pos += 1;
+        word.quoted = true;
+        loop {
+            match self.peek() {
+                None => return Err("unterminated single quote".into()),
+                Some('\'') => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                Some(c) => {
+                    word.text.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// A double-quoted `"..."` segment (pos at the opening `"`). Expansions and
+    /// command substitutions inside are still parsed by their normal handlers,
+    /// so their metadata (dynamic / assigns) is preserved.
+    fn double_quote(&mut self, word: &mut Word) -> Result<(), String> {
+        self.pos += 1;
+        word.quoted = true;
+        loop {
+            match self.peek() {
+                None => return Err("unterminated double quote".into()),
+                Some('"') => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                Some('\\') if matches!(self.peek_at(1), Some('"' | '\\' | '$' | '`' | '\n')) => {
+                    let next = self.chars[self.pos + 1];
+                    if next != '\n' {
+                        word.text.push(next);
+                    }
+                    self.pos += 2;
+                }
+                Some('$') => self.dollar(word, true)?,
+                Some('`') => {
+                    self.pos += 1;
+                    self.backtick()?;
+                    word.text.push_str("$(...)");
+                    word.dynamic = true;
+                }
+                Some(c) => {
+                    word.text.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// An ANSI-C `$'...'` string (pos at the `$`, next char `'`). Its escapes
+    /// are decoded but it is otherwise literal, so it only marks the word quoted.
+    fn ansi_c_string(&mut self, word: &mut Word) -> Result<(), String> {
+        self.pos += 2;
+        word.quoted = true;
+        loop {
+            match self.peek() {
+                None => return Err("unterminated $'...' string".into()),
+                Some('\'') => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                Some('\\') => {
+                    self.pos += 1;
+                    self.ansi_c_escape(word)?;
+                }
+                Some(c) => {
+                    word.text.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
     }
 
     fn word(&mut self) -> Result<Word, String> {
@@ -540,86 +1143,138 @@ impl Parser {
                         None => word.text.push('\\'),
                     }
                 }
-                '\'' => {
-                    self.pos += 1;
-                    word.quoted = true;
-                    loop {
-                        match self.peek() {
-                            None => return Err("unterminated single quote".into()),
-                            Some('\'') => {
-                                self.pos += 1;
-                                break;
-                            }
-                            Some(c) => {
-                                word.text.push(c);
-                                self.pos += 1;
-                            }
-                        }
-                    }
-                }
-                '"' => {
-                    self.pos += 1;
-                    word.quoted = true;
-                    loop {
-                        match self.peek() {
-                            None => return Err("unterminated double quote".into()),
-                            Some('"') => {
-                                self.pos += 1;
-                                break;
-                            }
-                            Some('\\') if matches!(self.peek_at(1), Some('"' | '\\' | '$' | '`' | '\n')) => {
-                                let next = self.chars[self.pos + 1];
-                                if next != '\n' {
-                                    word.text.push(next);
-                                }
-                                self.pos += 2;
-                            }
-                            Some('$') => self.dollar(&mut word)?,
-                            Some('`') => {
-                                self.pos += 1;
-                                self.backtick()?;
-                                word.text.push_str("$(...)");
-                                word.dynamic = true;
-                            }
-                            Some(c) => {
-                                word.text.push(c);
-                                self.pos += 1;
-                            }
-                        }
-                    }
-                }
-                '$' if self.peek_at(1) == Some('\'') => {
-                    self.pos += 2;
-                    word.quoted = true;
-                    loop {
-                        match self.peek() {
-                            None => return Err("unterminated $'...' string".into()),
-                            Some('\'') => {
-                                self.pos += 1;
-                                break;
-                            }
-                            Some('\\') => {
-                                self.pos += 1;
-                                self.ansi_c_escape(&mut word)?;
-                            }
-                            Some(c) => {
-                                word.text.push(c);
-                                self.pos += 1;
-                            }
-                        }
-                    }
-                }
-                '$' => self.dollar(&mut word)?,
+                '\'' => self.single_quote(&mut word)?,
+                '"' => self.double_quote(&mut word)?,
+                '$' if self.peek_at(1) == Some('\'') => self.ansi_c_string(&mut word)?,
+                '$' => self.dollar(&mut word, false)?,
                 '`' => {
                     self.pos += 1;
                     self.backtick()?;
                     word.text.push_str("$(...)");
                     word.dynamic = true;
+                    word.splits = true;
                 }
                 '*' | '?' | '[' => {
                     word.glob = true;
+                    word.splits = true;
                     word.text.push(c);
                     self.pos += 1;
+                }
+                '{' => {
+                    // Unquoted brace expansion (`{a,b}`) yields one argument
+                    // per alternative, so the word can split into several
+                    // (e.g. `sort -T {/tmp,-oout}` supplies `-T /tmp -oout`).
+                    // Parse the alternatives with the *normal* lexer handlers
+                    // so quotes, command substitutions and parameter
+                    // expansions inside braces keep their metadata — a nested
+                    // `{a,`mktemp`}` is still inspected, a `{x,${d:=/etc}}`
+                    // still marks the word assigning — instead of being
+                    // swallowed as literal characters. Quoted/escaped braces
+                    // are literal (handled above).
+                    word.text.push(c);
+                    self.pos += 1;
+                    let mut depth = 1usize;
+                    let mut has_comma = false;
+                    let mut has_range = false;
+                    while let Some(c) = self.peek() {
+                        if is_operator(c) || matches!(c, ' ' | '\t' | '\r') {
+                            break;
+                        }
+                        match c {
+                            '\\' => {
+                                self.pos += 1;
+                                match self.peek() {
+                                    Some('\n') => self.pos += 1,
+                                    Some(next) => {
+                                        word.text.push(next);
+                                        word.quoted = true;
+                                        self.pos += 1;
+                                    }
+                                    None => word.text.push('\\'),
+                                }
+                            }
+                            '\'' => self.single_quote(&mut word)?,
+                            '"' => self.double_quote(&mut word)?,
+                            '$' if self.peek_at(1) == Some('\'') => self.ansi_c_string(&mut word)?,
+                            '$' => self.dollar(&mut word, false)?,
+                            '`' => {
+                                self.pos += 1;
+                                self.backtick()?;
+                                word.text.push_str("$(...)");
+                                word.dynamic = true;
+                                // Like the top-level backtick handler, an
+                                // unquoted command substitution inside braces
+                                // word-splits: `{`printf '/tmp -oresult'`}`
+                                // expands to `{/tmp` and `-oresult}`, so the
+                                // option-value consumers that key on `splits`
+                                // must reject it.
+                                word.splits = true;
+                            }
+                            '{' => {
+                                depth += 1;
+                                word.text.push(c);
+                                self.pos += 1;
+                            }
+                            '}' => {
+                                depth = depth.saturating_sub(1);
+                                word.text.push(c);
+                                self.pos += 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            ',' => {
+                                // A comma at *any* brace depth is an
+                                // alternative separator for some enclosing
+                                // brace: `{{a,b},c}` and `-o{{a,b}}` both
+                                // expand to one argument per inner
+                                // alternative. Recognising only depth 1 left
+                                // nested lists (`-o{{a,b}}` → `-o{a}` /
+                                // `-o{b}`) unmarked, so propagate the split
+                                // from nested braces too.
+                                has_comma = true;
+                                word.text.push(c);
+                                self.pos += 1;
+                            }
+                            '.' if self.peek_at(1) == Some('.') => {
+                                // A sequence range `{a..z}` / `{1..9}` /
+                                // `{1..9..2}` expands to one argument per
+                                // step, exactly like a comma list — including
+                                // when nested inside another brace. Treat the
+                                // `..` marker the same way at any depth.
+                                has_range = true;
+                                word.text.push_str("..");
+                                self.pos += 2;
+                            }
+                            // Unquoted wildcards keep their pathname-expansion
+                            // metadata inside braces too: `-o{*}` expands to
+                            // one argument per matching file (files `-o{a}` and
+                            // `-o{b}` → `-o{a}` + `-o{b}`), so the consumed
+                            // option value is not a single argument. Mirror the
+                            // top-level `*`/`?`/`[` handler.
+                            '*' | '?' | '[' => {
+                                word.glob = true;
+                                word.splits = true;
+                                word.text.push(c);
+                                self.pos += 1;
+                            }
+                            _ => {
+                                word.text.push(c);
+                                self.pos += 1;
+                            }
+                        }
+                    }
+                    if has_comma || has_range {
+                        // One argument per alternative (comma list) or per step
+                        // (sequence range): the word both splits and is a
+                        // computed value, so the option, destination and format
+                        // checks that key on `dynamic` reject it (`sort
+                        // {input,-oresult}`, `read {name,PATH}`, `printf
+                        // -v{c..d}`) — not only the option-value consumers that
+                        // key on `splits`.
+                        word.splits = true;
+                        word.dynamic = true;
+                    }
                 }
                 _ => {
                     word.text.push(c);
@@ -728,5 +1383,263 @@ mod tests {
         }
         let deep = "$(".repeat(40) + &")".repeat(40);
         assert!(parse(&format!("echo {deep}")).is_err());
+    }
+
+    /// Round-9 advisory: unquoted `{a,b}` expands to one argument per
+    /// alternative, so it must set `splits` (the option-value consumers rely on
+    /// it to reject smuggled extra options).
+    #[test]
+    fn unquoted_brace_expansion_splits() {
+        let brace = parse("sort -T {/tmp,-oout} input").unwrap().remove(0).words.remove(2);
+        assert_eq!(brace.text, "{/tmp,-oout}");
+        assert!(brace.splits, "brace expansion must split");
+        // A brace without a comma (`{a}`, a `{ ...; }` group word) does not
+        // expand to multiple arguments.
+        let plain = parse("echo {a}").unwrap().remove(0).words.remove(1);
+        assert!(!plain.splits, "single brace word stays one argument");
+        // Quoted braces are literal, not expansion.
+        let quoted = parse("echo '{a,b}'").unwrap().remove(0).words.remove(1);
+        assert!(!quoted.splits, "quoted braces are literal");
+    }
+
+    /// Round-9 advisory: nested expansions and substring offsets are evaluated
+    /// when the outer expansion runs, so their writes must flag `assigns`.
+    #[test]
+    fn nested_and_substring_expansions_assign() {
+        let nested_arith = parse("echo \"${x:-$((PATH=0))}\"").unwrap().remove(0).words.remove(1);
+        assert!(nested_arith.assigns, "${{x:-$((PATH=0))}} assigns PATH");
+        let nested_param = parse("echo \"${missing:-${d:=/etc}}\"").unwrap().remove(0).words.remove(1);
+        assert!(nested_param.assigns, "${{missing:-${{d:=/etc}}}} assigns d");
+        let substring = parse("echo \"${text:PATH=0:1}\"").unwrap().remove(0).words.remove(1);
+        assert!(substring.assigns, "${{text:PATH=0:1}} assigns PATH via offset");
+        // Read-only forms stay clean.
+        let read = parse("echo \"${x:-default}\"").unwrap().remove(0).words.remove(1);
+        assert!(!read.assigns, "${{x:-default}} only reads");
+        let sub = parse("echo \"${text:0:1}\"").unwrap().remove(0).words.remove(1);
+        assert!(!sub.assigns, "${{text:0:1}} has a constant offset");
+    }
+
+    /// Round-9 advisory: `&&` / `||` inside `[[ ... ]]` are conditional
+    /// logic, not command separators, so the conditional stays one command.
+    #[test]
+    fn logical_operators_stay_inside_conditional() {
+        // The whole `[[ ... && ... ]]` is a single command; nothing splits off.
+        let cmds = parse("while [[ -f marker && -r marker ]]; do cat marker; break; done").unwrap();
+        assert!(
+            cmds.iter().any(|s| s.words.iter().any(|w| w.text == "&&")),
+            "the && should be a word inside the conditional, got {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|s| s.words.first().is_some_and(|w| w.text == "-r")),
+            "no command should start at -r, got {cmds:?}"
+        );
+        let cmds = parse("for f in a z; do [[ \"$f\" == a || \"$f\" == z ]]; done").unwrap();
+        assert!(
+            cmds.iter().any(|s| s.words.iter().any(|w| w.text == "||")),
+            "the || should be a word inside the conditional, got {cmds:?}"
+        );
+    }
+
+    /// Round-10 thread: the brace scanner must parse quotes, command
+    /// substitutions and parameter expansions inside `{...}` with the normal
+    /// lexer handlers, not swallow them as literal characters.
+    #[test]
+    fn brace_expansion_preserves_inner_parsing() {
+        // A command substitution inside a brace alternative is still inspected
+        // (it appears as a nested simple command in the parse), not hidden.
+        let cmds = parse("echo {a,`mktemp`}").unwrap();
+        assert!(
+            cmds.iter().any(|s| s.words.first().is_some_and(|w| w.text == "mktemp")),
+            "mktemp inside the brace must be parsed as a command, got {cmds:?}"
+        );
+        // A parameter assignment inside a brace alternative keeps its assign
+        // metadata instead of being lost as text.
+        let assign = parse("echo {x,${d:=/etc}}").unwrap().remove(0).words.remove(1);
+        assert!(assign.assigns, "{{x,${{d:=/etc}}}} assigns d");
+        // A dollar-arithmetic assignment inside a brace alternative too.
+        let arith = parse("echo {x,$((PATH=0))}").unwrap().remove(0).words.remove(1);
+        assert!(arith.assigns, "{{x,$((PATH=0))}} assigns PATH");
+        // A quoted comma is literal, not an alternative separator, but the word
+        // still parses without swallowing the quote.
+        let quoted = parse("echo {a,\"b,c\"}").unwrap().remove(0).words.remove(1);
+        assert!(quoted.splits, "the unquoted comma still makes the brace split");
+    }
+
+    /// Round-10 advisory: a brace-expanded word is a computed value, so the
+    /// effect-sensitive checks keyed on `dynamic` must see it as such — not
+    /// only the option-value checks keyed on `splits`.
+    #[test]
+    fn brace_expansion_marks_dynamic() {
+        let brace = parse("sort {input,-oresult} input").unwrap().remove(0).words.remove(1);
+        assert_eq!(brace.text, "{input,-oresult}");
+        assert!(brace.splits, "brace expansion splits");
+        assert!(brace.dynamic, "brace expansion is a computed word");
+        // A single-alternative brace is literal: neither splitting nor computed.
+        let plain = parse("sort {input} input").unwrap().remove(0).words.remove(1);
+        assert!(!plain.dynamic, "single brace word is not computed");
+    }
+
+    /// Round-10 advisory: the substring *length* field is arithmetic too, so an
+    /// assignment there (`${text:0:PATH=0}`) must flag `assigns`, not only the
+    /// offset.
+    #[test]
+    fn substring_length_arithmetic_assigns() {
+        let length = parse("echo \"${text:0:PATH=0}\"").unwrap().remove(0).words.remove(1);
+        assert!(length.assigns, "${{text:0:PATH=0}} assigns PATH via length");
+        let offset = parse("echo \"${text:PATH=0:1}\"").unwrap().remove(0).words.remove(1);
+        assert!(offset.assigns, "${{text:PATH=0:1}} assigns PATH via offset");
+        let clean = parse("echo \"${text:0:1}\"").unwrap().remove(0).words.remove(1);
+        assert!(!clean.assigns, "${{text:0:1}} has constant offset and length");
+    }
+
+    /// Round-11 advisory: a backtick command substitution inside a brace
+    /// alternative word-splits exactly like the top-level handler, so it must
+    /// set `splits` (`{`printf '/tmp -oresult'`}` becomes `{/tmp` + `-oresult}`).
+    #[test]
+    fn backtick_inside_brace_splits() {
+        let cmds = parse("sort -T {`printf '/tmp -oresult'`} input").unwrap();
+        let outer = cmds.iter().find(|s| s.words.first().is_some_and(|w| w.text == "sort")).unwrap();
+        let word = &outer.words[2];
+        assert!(word.splits, "backtick inside braces word-splits");
+        assert!(word.dynamic, "backtick inside braces is a computed word");
+    }
+
+    /// Round-11 advisory: a brace *range* (`{c..d}`, `{1..9}`) expands to one
+    /// argument per step just like a comma list, so it must be marked computed
+    /// and splitting — not treated as a literal destination.
+    #[test]
+    fn brace_range_marks_dynamic() {
+        let alpha = parse("printf -v{c..d} '%s' /etc").unwrap().remove(0).words.remove(1);
+        assert_eq!(alpha.text, "-v{c..d}");
+        assert!(alpha.splits, "alphabetic brace range splits");
+        assert!(alpha.dynamic, "alphabetic brace range is a computed word");
+        let numeric = parse("sort -T {1..9} input").unwrap().remove(0).words.remove(2);
+        assert!(numeric.splits, "numeric brace range splits");
+        assert!(numeric.dynamic, "numeric brace range is a computed word");
+        // A single dot is not a range marker, so a lone brace stays literal.
+        let plain = parse("sort {input} input").unwrap().remove(0).words.remove(1);
+        assert!(!plain.dynamic, "non-range single brace word is not computed");
+    }
+
+    /// Round-11 advisory: an expanding here-document body is an assignment
+    /// surface — its expansions run when the heredoc is delivered — so a
+    /// parameter/arithmetic assignment in the body must be detected. A
+    /// quoted-delimiter (non-expanding) heredoc is inert.
+    #[test]
+    fn heredoc_body_assigns_detects_expansions() {
+        assert!(heredoc_body_assigns("${text:PATH=0:1}\n"), "offset-field assignment");
+        assert!(heredoc_body_assigns("${text:0:PATH=0}\n"), "length-field assignment");
+        assert!(heredoc_body_assigns("${d:=/etc}\n"), ":= default assignment");
+        assert!(heredoc_body_assigns("$((PATH=0))\n"), "arithmetic assignment");
+        assert!(!heredoc_body_assigns("plain ${text} and ${d:-x}\n"), "reads do not assign");
+        assert!(!heredoc_body_assigns("no expansions here\n"), "literal body");
+        // An escaped expansion is literal, so it does not assign.
+        assert!(!heredoc_body_assigns("\\${d:=/etc}\n"), "escaped expansion is literal");
+    }
+
+    /// Round-12 advisory: an indirect parameter expansion `${!ref:=value}`
+    /// assigns the variable `ref` points to, so the assignment operator after
+    /// the indirect name must be detected — the parser must not stop at the
+    /// `!` and treat the rest as a plain read.
+    #[test]
+    fn indirect_expansion_assigns() {
+        let assign = parse("echo \"${!ref:=/etc}\"").unwrap().remove(0).words.remove(1);
+        assert!(assign.assigns, "${{!ref:=/etc}} assigns through the indirect name");
+        let plus = parse("echo \"${!ref+=/etc}\"").unwrap().remove(0).words.remove(1);
+        assert!(plus.assigns, "${{!ref+=/etc}} appends through the indirect name");
+        // A plain indirect read does not assign.
+        let read = parse("echo \"${!ref}\"").unwrap().remove(0).words.remove(1);
+        assert!(!read.assigns, "${{!ref}} only reads");
+        // Name-enumeration forms are read-only.
+        let names = parse("echo \"${!prefix@}\"").unwrap().remove(0).words.remove(1);
+        assert!(!names.assigns, "${{!prefix@}} enumerates names, no assignment");
+        // The same detection drives the expanding-heredoc scan, which shares
+        // this helper.
+        assert!(heredoc_body_assigns("${!ref:=/etc}\n"), "indirect assignment in a heredoc body");
+        assert!(!heredoc_body_assigns("${!ref}\n"), "indirect read in a heredoc body");
+    }
+
+    /// Round-12 advisory: a comma or range *nested* inside another brace still
+    /// expands the word to one argument per alternative/step, so it must mark
+    /// the word computed and splitting even though the separator is not at
+    /// depth 1 (`-o{{a,b}}` → `-o{a}` / `-o{b}`).
+    #[test]
+    fn nested_brace_expansion_marks_dynamic() {
+        let nested_comma = parse("sort -T -o{{a,b}} input").unwrap().remove(0).words.remove(2);
+        assert_eq!(nested_comma.text, "-o{{a,b}}");
+        assert!(nested_comma.splits, "nested comma brace splits");
+        assert!(nested_comma.dynamic, "nested comma brace is a computed word");
+        let nested_range = parse("sort -T {{1..3}} input").unwrap().remove(0).words.remove(2);
+        assert!(nested_range.splits, "nested range brace splits");
+        assert!(nested_range.dynamic, "nested range brace is a computed word");
+        // A brace with no comma or range at any depth stays literal.
+        let plain = parse("sort {{a}} input").unwrap().remove(0).words.remove(1);
+        assert!(!plain.dynamic, "single nested brace word is not computed");
+    }
+
+    /// Round-13 advisory: a positional/array-list expansion nested in a quoted
+    /// default still expands to one argument per element, so the outer quoted
+    /// word splits (`sort -T "${missing:-"$@"}"` → `-T /tmp -oresult`).
+    #[test]
+    fn quoted_default_nested_list_splits() {
+        let at = parse("sort -T \"${missing:-\"$@\"}\" input").unwrap().remove(0).words.remove(2);
+        assert!(at.splits, "${{missing:-\"$@\"}} expands to the positional list");
+        let arr = parse("sort -T \"${missing:-\"${arr[@]}\"}\" input").unwrap().remove(0).words.remove(2);
+        assert!(arr.splits, "${{missing:-\"${{arr[@]}}\"}} expands to the array elements");
+        let star = parse("sort -T \"${missing:-\"$*\"}\" input").unwrap().remove(0).words.remove(2);
+        assert!(star.splits, "${{missing:-\"$*\"}} expands to the positional list");
+        // A quoted default with no nested list stays a single argument.
+        let plain = parse("sort -T \"${missing:-/tmp}\" input").unwrap().remove(0).words.remove(2);
+        assert!(!plain.splits, "${{missing:-/tmp}} is a single literal default");
+        // A nested scalar read does not split.
+        let scalar = parse("sort -T \"${missing:-\"$dir\"}\" input").unwrap().remove(0).words.remove(2);
+        assert!(!scalar.splits, "${{missing:-\"$dir\"}} is a single scalar default");
+        // A nested *length* (`${#arr[@]}` is the element count, a scalar) is not
+        // a list — the `[@]` belongs to the nested expansion, not the outer one.
+        let count = parse("sort -T \"${missing:-\"${#arr[@]}\"}\" input").unwrap().remove(0).words.remove(2);
+        assert!(!count.splits, "${{missing:-\"${{#arr[@]}}\"}} is a scalar count, not a list");
+        // A top-level `${#arr[@]}` count is a scalar too.
+        let top_count = parse("sort -T \"${#arr[@]}\" input").unwrap().remove(0).words.remove(2);
+        assert!(!top_count.splits, "${{#arr[@]}} is a scalar count");
+        // A top-level positional/array list still splits even when quoted.
+        let top_at = parse("sort -T \"${@}\" input").unwrap().remove(0).words.remove(2);
+        assert!(top_at.splits, "${{@}} is a positional list");
+        let top_arr = parse("sort -T \"${arr[@]}\" input").unwrap().remove(0).words.remove(2);
+        assert!(top_arr.splits, "${{arr[@]}} is an array list");
+        // Round-14 advisory: a positional/array list can hide behind *several*
+        // levels of nested defaults — scanning must recurse into each nested
+        // `${...}` rather than skipping to its closing brace.
+        let deep_at = parse("sort -T \"${outer:-${inner:-\"$@\"}}\" input").unwrap().remove(0).words.remove(2);
+        assert!(deep_at.splits, "${{outer:-${{inner:-\"$@\"}}}} reaches the positional list");
+        let deeper = parse("sort -T \"${a:-${b:-${c:-\"$@\"}}}\" input").unwrap().remove(0).words.remove(2);
+        assert!(deeper.splits, "three levels of defaults still reach the positional list");
+        let deep_arr = parse("sort -T \"${outer:-${inner:-\"${arr[@]}\"}}\" input").unwrap().remove(0).words.remove(2);
+        assert!(deep_arr.splits, "a nested array list splits through nested defaults");
+        // A nested *scalar* default, however deep, must not split.
+        let deep_scalar = parse("sort -T \"${outer:-${inner:-\"$dir\"}}\" input").unwrap().remove(0).words.remove(2);
+        assert!(!deep_scalar.splits, "a nested scalar default stays a single argument");
+        // A nested *length* count, however deep, stays a scalar (no false
+        // positive from the old `contains(\"[@]\")` substring test).
+        let deep_count = parse("sort -T \"${outer:-${#arr[@]}}\" input").unwrap().remove(0).words.remove(2);
+        assert!(!deep_count.splits, "a nested ${{#arr[@]}} count is a scalar, not a list");
+    }
+
+    /// Round-13 advisory: unquoted wildcards inside a brace expansion keep
+    /// their pathname-expansion metadata, so a consumed option value built from
+    /// one is not treated as a single argument (`sort -T -o{*} input` →
+    /// `-o{a}` + `-o{b}` when those files exist).
+    #[test]
+    fn brace_wildcard_keeps_glob_metadata() {
+        let star = parse("sort -T -o{*} input").unwrap().remove(0).words.remove(2);
+        assert_eq!(star.text, "-o{*}");
+        assert!(star.glob, "wildcard inside braces is a glob");
+        assert!(star.splits, "wildcard inside braces word-splits");
+        let q = parse("sort -T -o{a?b} input").unwrap().remove(0).words.remove(2);
+        assert!(q.glob && q.splits, "`?` inside braces globs and splits");
+        let class = parse("sort -T -o{a[bc]} input").unwrap().remove(0).words.remove(2);
+        assert!(class.glob && class.splits, "`[...]` inside braces globs and splits");
+        // A brace with no wildcard, comma or range stays literal.
+        let plain = parse("sort -T -o{ab} input").unwrap().remove(0).words.remove(2);
+        assert!(!plain.glob && !plain.splits, "literal brace word is not a glob");
     }
 }
